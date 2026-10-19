@@ -5,7 +5,7 @@ Tk/ttk only: no Pillow, NumPy, CUDA, Figma token, or network at GUI import time.
 from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
-from .ui_generated import DesignerBrand, DesignerDiagram
+from .ui_generated import DesignerBrand
 
 BG = '#F4F6FA'
 INK = '#17243B'
@@ -320,22 +320,116 @@ class ModernView:
 
     def _summary(self,parent):
         a=self.app
-        card=tk.Frame(parent,bg='white',highlightbackground=BORDER,highlightthickness=1,width=280)
+        card=tk.Frame(parent,bg='white',highlightbackground=BORDER,highlightthickness=1,width=322)
         card.grid(row=0,column=1,sticky='ns');card.grid_propagate(False)
         card.columnconfigure(0,weight=1);card.rowconfigure(0,weight=1)
         self.summary_page=ScrollPage(card);self.summary_page.grid(row=0,column=0,sticky='nsew')
         body=self.summary_page.body;body.configure(padding=(16,18,16,16))
-        ttk.Label(body,text='РЕЗУЛЬТАТ',style='Eyebrow.TLabel').pack(anchor='w')
-        title=ttk.Frame(body);title.pack(fill='x',pady=(8,12))
-        ttk.Label(title,text='Ваш новый JPEG',font=('Segoe UI',12,'bold')).pack(side='left')
-        DesignerDiagram(body).pack(anchor='center')
-        ttk.Label(body,text='Схема, не превью фотографии',style='Muted.TLabel',font=('Segoe UI',9),wraplength=220,justify='center').pack(anchor='center',pady=(8,8))
+        ttk.Label(body,text='ПРЕВЬЮ',style='Eyebrow.TLabel').pack(anchor='w')
+        title=ttk.Frame(body);title.pack(fill='x',pady=(8,10))
+        ttk.Label(title,text='Настоящий JPEG',font=('Segoe UI',12,'bold')).pack(side='left')
+        self._preview_data=None;self._preview_images={}
+        self.preview_canvas=tk.Canvas(body,height=190,background='#101827',
+            highlightthickness=1,highlightbackground='#26324A',bd=0)
+        self.preview_canvas.pack(fill='x',pady=(0,8))
+        self.preview_canvas.bind('<Configure>',self._preview_resized)
+        self.preview_canvas.bind('<ButtonPress-1>',lambda e:self.preview_canvas.scan_mark(e.x,e.y))
+        self.preview_canvas.bind('<B1-Motion>',lambda e:self.preview_canvas.scan_dragto(e.x,e.y,gain=1))
+        self.clear_preview()
+        self.preview_choose=self.control(ttk.Button(body,text='Выбрать изображение…',command=a._choose_preview_file))
+        self.preview_choose.pack(fill='x',pady=(0,8))
+        mode_row=ttk.Frame(body);mode_row.pack(fill='x',pady=(0,6))
+        ttk.Label(mode_row,text='Показ',style='Muted.TLabel').pack(side='left')
+        self.preview_mode_combo=self.control(ttk.Combobox(mode_row,state='readonly',
+            values=['Результат','Оригинал','До / после'],textvariable=a.preview_mode_var,width=13))
+        self.preview_mode_combo.pack(side='right')
+        view_row=ttk.Frame(body);view_row.pack(fill='x',pady=(0,8))
+        self.preview_fit_button=self.control(ttk.Button(view_row,text='Вписать',command=lambda:a._set_preview_view('fit')))
+        self.preview_fit_button.pack(side='left')
+        self.preview_actual_button=self.control(ttk.Button(view_row,text='100%',command=lambda:a._set_preview_view('actual')))
+        self.preview_actual_button.pack(side='left',padx=(6,0))
+        ttk.Label(body,textvariable=a.preview_status_var,style='Muted.TLabel',
+            font=('Segoe UI',9),wraplength=276).pack(anchor='w',pady=(0,4))
+        ttk.Label(body,textvariable=a.preview_info_var,font=('Segoe UI',9,'bold'),
+            wraplength=276).pack(anchor='w',pady=(0,2))
+        ttk.Label(body,textvariable=a.preview_meta_var,style='Muted.TLabel',
+            font=('Segoe UI',9),wraplength=276).pack(anchor='w',pady=(0,8))
+        self.set_preview_view('fit')
         self.summary_size=tk.StringVar();self.summary_quality=tk.StringVar();self.summary_mode=tk.StringVar();self.summary_backend=tk.StringVar();self.summary_write=tk.StringVar()
         for label,var in [('ГРАНИЦЫ / МАСШТАБ',self.summary_size),('КАЧЕСТВО',self.summary_quality),('ГЕОМЕТРИЯ',self.summary_mode),('ДВИЖОК',self.summary_backend)]:
             ttk.Separator(body).pack(fill='x',pady=(0,6))
             ttk.Label(body,text=label,style='Eyebrow.TLabel').pack(anchor='w')
-            ttk.Label(body,textvariable=var,font=('Segoe UI',11,'bold'),wraplength=220).pack(anchor='w',pady=(5,6))
-        ttk.Label(body,textvariable=self.summary_write,style='Muted.TLabel',wraplength=220).pack(anchor='w',pady=(4,0))
+            ttk.Label(body,textvariable=var,font=('Segoe UI',11,'bold'),wraplength=276).pack(anchor='w',pady=(5,6))
+        ttk.Label(body,textvariable=self.summary_write,style='Muted.TLabel',wraplength=276).pack(anchor='w',pady=(4,0))
+
+    # -- real preview panel --------------------------------------------------
+    def clear_preview(self,text='Выберите изображение для превью'):
+        self._preview_data=None;self._preview_images={}
+        canvas=self.preview_canvas;canvas.delete('all');canvas.configure(scrollregion='')
+        width=max(canvas.winfo_width(),240)
+        canvas.create_text(width/2,95,text=text,fill='#93A4C3',width=250,
+            justify='center',font=('Segoe UI',9))
+
+    def _preview_resized(self,event=None):
+        if self._preview_data is None:
+            self.clear_preview()
+        else:
+            self._draw_preview()
+        self.app._on_preview_resize(event)
+
+    def show_preview(self,data):
+        images={}
+        for key in ('original','result'):
+            path=(data.get(key) or {}).get('path')
+            if not path:
+                return False
+            try:
+                images[key]=tk.PhotoImage(master=self.app,file=path)
+            except tk.TclError:
+                return False
+        self._preview_images=images;self._preview_data=data
+        self._draw_preview()
+        return True
+
+    def _draw_preview(self):
+        canvas=self.preview_canvas;data=self._preview_data
+        canvas.delete('all')
+        if not data:
+            self.clear_preview();return
+        cw=max(canvas.winfo_width(),120);ch=max(canvas.winfo_height(),120)
+        mode=self.app.preview_mode_var.get()
+        if mode=='До / после':
+            half=cw/2
+            for key,label,x0 in (('original','До',0),('result','После',half)):
+                image=self._preview_images.get(key)
+                if image is None:continue
+                x=x0+(half-image.width())/2;y=(ch-image.height())/2
+                canvas.create_image(x,y,image=image,anchor='nw')
+                canvas.create_text(x0+8,8,text=label,fill='#E7EEFB',anchor='nw',
+                    font=('Segoe UI',9,'bold'))
+            canvas.create_line(half,10,half,ch-10,fill='#3A4B6C')
+            canvas.configure(scrollregion=(0,0,cw,ch))
+            return
+        key='original' if mode=='Оригинал' else 'result'
+        image=self._preview_images.get(key)
+        if image is None:return
+        if self.app.preview_view_var.get()=='actual' and (image.width()>cw or image.height()>ch):
+            canvas.configure(scrollregion=(0,0,max(cw,image.width()),max(ch,image.height())))
+            canvas.create_image(0,0,image=image,anchor='nw')
+            canvas.xview_moveto(0);canvas.yview_moveto(0)
+        else:
+            canvas.configure(scrollregion=(0,0,cw,ch))
+            canvas.create_image(cw/2,ch/2,image=image,anchor='center')
+
+    def set_preview_view(self,view):
+        before=self.app.preview_mode_var.get()=='До / после'
+        if before:view='fit'
+        self.app.preview_view_var.set(view)
+        self.preview_fit_button.configure(text='Вписать ✓' if view=='fit' else 'Вписать')
+        self.preview_actual_button.configure(text='100% ✓' if view=='actual' else '100%')
+        self.preview_actual_button.state(['disabled'] if before else ['!disabled'])
+        if self._preview_data is not None:
+            self._draw_preview()
 
     def _footer(self,parent):
         a=self.app
@@ -410,6 +504,8 @@ class ModernView:
         self.start_button.state(['disabled'] if running else ['!disabled'])
         self.doctor_button.state(['disabled'] if running else ['!disabled'])
         self.cancel_button.state(['!disabled'] if running else ['disabled'])
+        if not running:
+            self.set_preview_view(self.app.preview_view_var.get())
 
     def _schedule_summary(self,*args):
         if not self._summary_pending:

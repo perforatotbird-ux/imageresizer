@@ -21,6 +21,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .presets import ALL_QUALITY_PRESETS, SIZE_PRESETS, auto_subsampling
+from .preview import PreviewClient
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = PROJECT_DIR / "input"
@@ -130,9 +131,23 @@ class BatchResizeUI(tk.Tk):
         self.stats_var = tk.StringVar(value="")
         self.threads_var = tk.StringVar(value="")
 
+        self.preview_source_var = tk.StringVar(value="")
+        self.preview_mode_var = tk.StringVar(value="Результат")
+        self.preview_view_var = tk.StringVar(value="fit")
+        self.preview_status_var = tk.StringVar(value="Изображение не выбрано")
+        self.preview_info_var = tk.StringVar(value="")
+        self.preview_meta_var = tk.StringVar(value="")
+        self._preview_client: PreviewClient | None = None
+        self._preview_temp = tempfile.TemporaryDirectory(prefix="batchresize-preview-")
+        self._preview_request_id = 0
+        self._preview_after = None
+        self._preview_suspended = False
+        self._preview_has_result = False
+
         self._build()
         self._on_quality_change()
         self._on_preset_change()
+        self._install_preview_traces()
         self.after(100, self._drain_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -148,6 +163,212 @@ class BatchResizeUI(tk.Tk):
         path = filedialog.askdirectory(initialdir=initial)
         if path:
             var.set(path)
+
+    # -- preview -------------------------------------------------------------
+    def _install_preview_traces(self) -> None:
+        self.preview_source_var.trace_add("write", self._schedule_preview)
+        self.preview_mode_var.trace_add("write", self._on_preview_mode_change)
+        self.preview_view_var.trace_add("write", self._schedule_preview)
+        for var in (self.width_var, self.height_var, self.sizing_var,
+                    self.sizing_value_var, self.mode_var, self.allow_upscale_var,
+                    self.filter_var, self.jpeg_quality_var, self.subsampling_var,
+                    self.bg_color_var, self.backend_var, self.vram_var,
+                    self.exif_var, self.icc_var, self.truncated_var,
+                    self.fallback_var, self.huffman_var):
+            var.trace_add("write", self._schedule_preview)
+
+    def _choose_preview_file(self) -> None:
+        initial = self.preview_source_var.get().strip()
+        initial_dir = str(Path(initial).parent) if initial else str(PROJECT_DIR)
+        path = filedialog.askopenfilename(
+            title="Изображение для превью",
+            initialdir=initial_dir,
+            filetypes=[("Изображения", "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),
+                       ("Все файлы", "*.*")])
+        if path:
+            self.preview_source_var.set(path)
+
+    def _set_preview_view(self, view: str) -> None:
+        if self.preview_mode_var.get() == "До / после":
+            view = "fit"
+        self.preview_view_var.set(view)
+        self.view.set_preview_view(view)
+
+    def _on_preview_mode_change(self, *_args) -> None:
+        if self.preview_mode_var.get() == "До / после":
+            self.preview_view_var.set("fit")
+            self.view.set_preview_view("fit")
+        self._schedule_preview()
+
+    def _on_preview_resize(self, _event=None) -> None:
+        if self._preview_has_result and self.preview_source_var.get().strip():
+            self._schedule_preview()
+
+    def _schedule_preview(self, *_args) -> None:
+        if self._preview_suspended or self._is_running():
+            return
+        if self._preview_after is not None:
+            try:
+                self.after_cancel(self._preview_after)
+            except tk.TclError:
+                pass
+            self._preview_after = None
+        source = self.preview_source_var.get().strip()
+        if not source:
+            self._clear_preview()
+            return
+        if self._preview_has_result and self.preview_status_var.get().startswith("Готово"):
+            self.preview_status_var.set("Параметры изменены — обновляем превью…")
+        self._preview_after = self.after(320, self._request_preview)
+
+    def _preview_box(self) -> tuple[int, int]:
+        canvas = self.view.preview_canvas
+        width = max(80, canvas.winfo_width())
+        height = max(80, canvas.winfo_height())
+        if width < 120:
+            width, height = 292, 190
+        if self.preview_mode_var.get() == "До / после":
+            width = max(60, (width - 10) // 2)
+        return width, height
+
+    def _preview_params(self) -> dict:
+        from .cli import parse_color
+        from .validation import dimensions, positive
+
+        width = int(self.width_var.get())
+        height = int(self.height_var.get())
+        quality = int(self.jpeg_quality_var.get())
+        value = float(self.sizing_value_var.get())
+        vram = float(self.vram_var.get())
+        dimensions(width, height)
+        positive(vram, "VRAM budget")
+        sizing = self.sizing_var.get()
+        if sizing != "resolution":
+            positive(value, "Значение масштаба")
+        if not 1 <= quality <= 100:
+            raise ValueError("Качество должно быть от 1 до 100.")
+        subsampling = {"auto": auto_subsampling(quality), "444": 0,
+                       "422": 1, "420": 2}[self.subsampling_var.get()]
+        return {
+            "max_w": width,
+            "max_h": height,
+            "mode": self.mode_var.get(),
+            "quality": quality,
+            "subsampling": subsampling,
+            "sizing": sizing,
+            "sizing_value": value,
+            "allow_upscale": bool(self.allow_upscale_var.get()),
+            "keep_exif": bool(self.exif_var.get()),
+            "keep_icc": bool(self.icc_var.get()),
+            "bg_color": list(parse_color(self.bg_color_var.get())),
+            "vram_gb": vram,
+            "filter": self.filter_var.get(),
+            "fallback": bool(self.fallback_var.get()),
+            "allow_truncated": bool(self.truncated_var.get()),
+            "optimize_huffman": bool(self.huffman_var.get()),
+            "backend": self.backend_var.get(),
+        }
+
+    def _request_preview(self) -> None:
+        self._preview_after = None
+        if self._preview_suspended or self._is_running():
+            return
+        source = Path(self.preview_source_var.get().strip()).expanduser()
+        if not source.is_file():
+            self.preview_status_var.set("Файл превью не найден")
+            self.view.clear_preview("Файл превью не найден")
+            return
+        try:
+            params = self._preview_params()
+        except (ValueError, KeyError) as exc:
+            self.preview_status_var.set(f"Проверьте параметры: {exc}")
+            return
+        if self._preview_client is None:
+            self._preview_client = PreviewClient(
+                self.worker, PROJECT_DIR, Path(self._preview_temp.name), self._events)
+        width, height = self._preview_box()
+        view = self.preview_view_var.get()
+        if self.preview_mode_var.get() == "До / после":
+            view = "fit"
+        payload = {"source": str(source), "view": view,
+                   "box_w": width, "box_h": height, "params": params}
+        self._preview_request_id = self._preview_client.request(payload)
+        self.preview_status_var.set("Загрузка превью…")
+
+    def _handle_preview(self, payload: dict) -> None:
+        kind = payload.get("kind")
+        if kind == "log":
+            self._log_line(f"preview: {payload.get('text', '')}")
+            return
+        if kind == "dead":
+            self._log_line(f"preview: {payload.get('error', 'worker stopped')}")
+            if not self._preview_suspended:
+                self.preview_status_var.set(str(payload.get("error", "Превью недоступно")))
+            return
+        if kind == "invalidated":
+            return
+        if payload.get("id") != self._preview_request_id:
+            return
+        if not payload.get("ok"):
+            error = str(payload.get("error", "неизвестная ошибка"))
+            self.preview_status_var.set(f"Ошибка превью: {error}")
+            self._log_line(f"preview: {error}")
+            return
+        if not self.view.show_preview(payload):
+            self.preview_status_var.set("Не удалось показать превью")
+            return
+        self._preview_has_result = True
+        source_w = int(payload.get("source_w", 0))
+        source_h = int(payload.get("source_h", 0))
+        result_w = int(payload.get("result_w", 0))
+        result_h = int(payload.get("result_h", 0))
+        kb = int(payload.get("jpeg_bytes", 0)) / 1024
+        self.preview_info_var.set(
+            f"{source_w} × {source_h} → {result_w} × {result_h} px  ·  {kb:.0f} КиБ")
+        route = str(payload.get("route") or payload.get("backend") or "—")
+        requested = str(payload.get("requested_backend") or "—")
+        approximate = "  ·  приближённое" if payload.get("approximate") else ""
+        self.preview_meta_var.set(f"Движок: {route}  ·  запрошен: {requested}{approximate}")
+        self.preview_status_var.set("Готово" + (" · приближённое 100%" if payload.get("approximate") else ""))
+
+    def _clear_preview(self) -> None:
+        self._preview_has_result = False
+        self.preview_status_var.set("Изображение не выбрано")
+        self.preview_info_var.set("")
+        self.preview_meta_var.set("")
+        self.view.clear_preview()
+
+    def _pause_preview(self) -> None:
+        self._preview_suspended = True
+        if self._preview_after is not None:
+            try:
+                self.after_cancel(self._preview_after)
+            except tk.TclError:
+                pass
+            self._preview_after = None
+        if self._preview_client is not None:
+            self._preview_client.cancel()
+        self.preview_status_var.set("Превью приостановлено во время обработки")
+
+    def _resume_preview(self) -> None:
+        self._preview_suspended = False
+        if self.preview_source_var.get().strip():
+            self._schedule_preview()
+
+    def _stop_preview(self) -> None:
+        if self._preview_after is not None:
+            try:
+                self.after_cancel(self._preview_after)
+            except tk.TclError:
+                pass
+            self._preview_after = None
+        client, self._preview_client = self._preview_client, None
+        if client is not None:
+            client.close()
+        try:
+            self._preview_temp.cleanup()
+        except (OSError, PermissionError):
+            pass
 
     def _on_sizing_change(self, _event=None) -> None:
         idx = self.sizing_combo.current()
@@ -347,6 +568,7 @@ class BatchResizeUI(tk.Tk):
                 f"Интерпретатор не найден:\n{args[0]}\n\n"
                 "Сначала запустите install.bat.")
             return
+        self._pause_preview()
         self._start_time = time.perf_counter()
         self._stopping = False
         try:
@@ -430,6 +652,8 @@ class BatchResizeUI(tk.Tk):
                     self._handle_line(str(payload))
                 elif kind == "count":
                     self.recursive_note.set(str(payload))
+                elif kind == "preview":
+                    self._handle_preview(dict(payload))
                 elif kind == "exit":
                     self._handle_exit(int(payload))
         except queue.Empty:
@@ -487,7 +711,10 @@ class BatchResizeUI(tk.Tk):
         if hasattr(self, "_cancel_dir"):
             self._cancel_dir.cleanup()
         if getattr(self, "_closing", False):
+            self._stop_preview()
             self.destroy()
+        else:
+            self._resume_preview()
 
     def _on_close(self):
         if self._is_running():
@@ -495,6 +722,7 @@ class BatchResizeUI(tk.Tk):
             self._cancel()
             # Keep draining IPC until the child has saved its state.
             return
+        self._stop_preview()
         self.destroy()
 
 
