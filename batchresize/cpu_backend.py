@@ -1,7 +1,7 @@
 """CPU backends.
 
-``CpuEngine``      - the reference/fallback path: libjpeg-turbo decode + SIMD
-                     resize + libjpeg-turbo encode (all inside OpenCV).
+``CpuEngine``      - OpenCV decode/encode with Pillow fractional-box resampling.
+                     Alpha and managed non-RGB inputs use Pillow host decoding.
 ``decode_to_rgb``  - robust host-side decode used by the *hybrid* GPU mode
                      (Pillow covers exotic PNG/TIFF/WebP variants).
 """
@@ -82,18 +82,22 @@ class CpuEngine:
 
     # -- resize --------------------------------------------------------------
     def resize(self, img: np.ndarray, plan: Plan) -> np.ndarray:
-        x0 = int(round(plan.x0))
-        y0 = int(round(plan.y0))
-        x1 = int(round(plan.x0 + plan.cw))
-        y1 = int(round(plan.y0 + plan.ch))
-        x1 = min(x1, img.shape[1])
-        y1 = min(y1, img.shape[0])
-        region = img[y0:y1, x0:x1]
-        if (plan.out_w, plan.out_h) == (region.shape[1], region.shape[0]):
-            return np.ascontiguousarray(region)
-        down = plan.scale_x < 1.0 or plan.scale_y < 1.0
-        interp = cv2.INTER_AREA if down else cv2.INTER_LINEAR
-        return cv2.resize(region, (plan.out_w, plan.out_h), interpolation=interp)
+        from PIL import Image
+        from .validation import dimensions
+        dimensions(plan.out_w, plan.out_h)
+        if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
+            raise ValueError("resize requires uint8 BGR with three channels")
+        if plan.is_identity:
+            return np.ascontiguousarray(img)
+        filters = {"lanczos3": Image.Resampling.LANCZOS,
+                   "bilinear": Image.Resampling.BILINEAR,
+                   "box": Image.Resampling.BOX}
+        if self.filter not in filters:
+            raise ValueError(f"unknown filter {self.filter!r}")
+        rgb = Image.fromarray(np.ascontiguousarray(img[:, :, ::-1]))
+        box = (plan.x0, plan.y0, plan.x0 + plan.cw, plan.y0 + plan.ch)
+        out = rgb.resize((plan.out_w, plan.out_h), filters[self.filter], box=box)
+        return np.ascontiguousarray(np.asarray(out)[:, :, ::-1])
 
     # -- encode --------------------------------------------------------------
     @staticmethod
@@ -127,20 +131,25 @@ def decode_to_rgb(data: bytes, bg: tuple[int, int, int] = (255, 255, 255)
     """Host decode for hybrid mode. Returns (RGB/RGBA uint8, has_alpha)."""
     from PIL import Image
 
+    from PIL import ImageCms
     with Image.open(io.BytesIO(data)) as im:
-        has_alpha = im.mode in ("RGBA", "LA", "PA") or (
-            im.mode == "P" and "transparency" in im.info
-        )
-        if im.mode == "CMYK":
-            im = im.convert("RGB")
-        elif im.mode not in ("RGB", "RGBA", "L", "LA", "I;16", "I", "F"):
-            im = im.convert("RGBA" if has_alpha else "RGB")
-        if im.mode in ("I;16", "I", "F"):
+        im.load()
+        alpha = im.convert("RGBA").getchannel("A") if (
+            "A" in im.getbands() or "transparency" in im.info) else None
+        if im.info.get("icc_profile") and im.mode not in ("RGB", "RGBA", "P"):
+            profile = ImageCms.getOpenProfile(io.BytesIO(im.info["icc_profile"]))
+            colour = im.convert("L") if im.mode == "LA" else im
+            im = ImageCms.profileToProfile(colour, profile,
+                    ImageCms.createProfile("sRGB"), outputMode="RGB")
+        elif im.mode.startswith("I;16"):
             arr = np.asarray(im, dtype=np.float32)
-            arr = np.clip(arr / 257.0 if im.mode == "I;16" else arr, 0, 255)
-            rgb = np.repeat(arr[:, :, None].astype(np.uint8), 3, axis=2)
-            return rgb, False
-        arr = np.asarray(im)
-        if arr.ndim == 2:
-            arr = np.repeat(arr[:, :, None], 3, axis=2)
-        return np.ascontiguousarray(arr), has_alpha
+            arr = np.clip(arr / 257.0, 0, 255).round().astype(np.uint8)
+            return np.repeat(arr[:, :, None], 3, axis=2), False
+        elif im.mode in ("I", "F"):
+            arr = np.clip(np.asarray(im, dtype=np.float32), 0, 255).astype(np.uint8)
+            return np.repeat(arr[:, :, None], 3, axis=2), False
+        else:
+            im = im.convert("RGB")
+        if alpha is not None:
+            im.putalpha(alpha)
+        return np.ascontiguousarray(np.asarray(im)), alpha is not None

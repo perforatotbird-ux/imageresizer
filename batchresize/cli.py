@@ -10,10 +10,19 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .cpu_backend import CpuEngine
-from .env import doctor_report
-from .gpu_backend import GpuEngine, GpuUnavailable
-from .pipeline import Pipeline, RunOptions
+# Lightweight factories keep GUI/bootstrap usable without NumPy/CUDA installed.
+def CpuEngine(*args, **kwargs):
+    from .cpu_backend import CpuEngine as Engine
+    return Engine(*args, **kwargs)
+
+def GpuEngine(*args, **kwargs):
+    from .gpu_backend import GpuEngine as Engine
+    return Engine(*args, **kwargs)
+
+def doctor_report():
+    from .env import doctor_report as report
+    return report()
+
 from .presets import (ALL_QUALITY_PRESETS, SIZE_PRESETS, OutputSpec,
                       resolve_quality, resolve_size)
 
@@ -46,7 +55,7 @@ def parse_color(value: str) -> tuple[int, int, int]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="batchresize",
-        description="Batch image resizer: GPU (nvJPEG + CUDA) or CPU (OpenCV).",
+        description="Batch image resizer: nvImageCodec + CUDA or CPU (OpenCV/Pillow).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-i", "--input", default=str(DEFAULT_INPUT),
@@ -91,11 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--queue-depth", type=int, default=32,
                    help="bounded queue size between stages")
     p.add_argument("--vram-budget", type=float, default=2.0,
-                   help="max GiB of decoded pixels in flight")
+                   help="soft application-array estimate in GiB, NOT a hard VRAM cap")
     p.add_argument("--limit", type=int, default=None,
                    help="process only the first N files")
     p.add_argument("--skip-existing", action="store_true",
-                   help="skip files that already exist in the output folder")
+                   help="skip only outputs verified by source/config/output hashes and JPEG decode")
     p.add_argument("--overwrite", action="store_true", default=False,
                    help="overwrite existing results (default: on unless "
                         "--skip-existing is given)")
@@ -113,13 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-truncated", action="store_true",
                    help="try to decode truncated JPEGs instead of skipping")
     p.add_argument("--no-fallback", action="store_true",
-                   help="fail a file instead of decoding it on the CPU")
+                   help="disable application CPU fallback; codec-internal CPU routing may still occur")
     p.add_argument("--fsync", action="store_true",
                    help="fsync before the atomic rename (slower)")
     p.add_argument("--optimize-huffman", action="store_true",
                    help="optimized Huffman tables in the GPU encoder")
     p.add_argument("--report", default=None,
                    help="path to the JSON report (default: <output>/report.json)")
+    p.add_argument("--profile-cuda", action="store_true",
+                   help="synchronize GPU stages for service profiling (changes throughput)")
     p.add_argument("--benchmark", action="store_true",
                    help="compare GPU and CPU backends on the same files")
     p.add_argument("--benchmark-repeats", type=int, default=3,
@@ -131,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--doctor", action="store_true",
                    help="print the environment report and exit")
     p.add_argument("--version", action="version",
-                   version="batchresize 0.1.0")
+                   version="batchresize " + __import__("batchresize").__version__)
     return p
 
 
@@ -141,7 +152,8 @@ def _resolve_paths(args) -> tuple[Path, Path]:
     return src, dst
 
 
-def _make_options(args, src: Path, dst: Path) -> RunOptions:
+def _make_options(args, src: Path, dst: Path):
+    from .pipeline import RunOptions
     if args.size == "custom" and (args.width is None or args.height is None):
         raise SystemExit("error: --size custom requires --width and --height")
     try:
@@ -195,23 +207,26 @@ def _make_options(args, src: Path, dst: Path) -> RunOptions:
         allow_truncated=args.allow_truncated,
         optimize_huffman=args.optimize_huffman,
         fsync=args.fsync,
+        profile_cuda=args.profile_cuda,
+        cancel_file=Path(os.environ["BATCHRESIZE_CANCEL_FILE"]) if os.environ.get("BATCHRESIZE_CANCEL_FILE") else None,
     )
 
 
-def _select_engine(backend: str):
+def _select_engine(backend: str, opts=None):
     """Return (engine, engine_kind); ``(None, "fail")`` for a hard GPU request."""
     if backend == "cpu":
-        return CpuEngine(), "cpu"
+        return CpuEngine(opts.filter_name if opts else "lanczos3"), "cpu"
 
     try:
-        engine = GpuEngine(optimize_huffman=False)
+        engine = GpuEngine(filter_name=opts.filter_name if opts else "lanczos3",
+                           optimize_huffman=opts.optimize_huffman if opts else False)
         ok, msg = engine.self_test()
         if not ok:
-            raise GpuUnavailable(f"GPU self-test failed: {msg}")
+            raise RuntimeError(f"GPU self-test failed: {msg}")
     except Exception as exc:
         if backend == "auto":
             print(f"gpu unavailable ({exc}); falling back to CPU")
-            return CpuEngine(), "cpu"
+            return CpuEngine(opts.filter_name if opts else "lanczos3"), "cpu"
         print(f"FATAL: GPU backend requested but unavailable: {exc}")
         return None, "fail"
 
@@ -250,6 +265,9 @@ def _print_summary(rep: dict) -> None:
     print(f"Avg per file : read {t['read']:.1f} ms, decode {t['decode']:.1f} ms, "
           f"resize {t['resize']:.1f} ms, encode {t['encode']:.1f} ms, "
           f"write {t['write']:.1f} ms")
+    for category in ("fatal_errors", "discovery_errors", "warnings"):
+        for message in rep.get(category, [])[:5]:
+            print(f"{category}: {message}")
     if rep["errors"]:
         print(f"Errors       : {len(rep['errors'])} (first 5)")
         for path, err in rep["errors"][:5]:
@@ -258,37 +276,74 @@ def _print_summary(rep: dict) -> None:
 
 
 def _write_report(rep: dict, report_path: Path) -> None:
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(rep, indent=2, ensure_ascii=False),
-                           encoding="utf-8")
+    from .safety import atomic_write, STATE_NAME, LOCK_NAME
+    if report_path.suffix.lower() != ".json" or report_path.name in (STATE_NAME, LOCK_NAME):
+        raise ValueError("report must be a separate .json file, not an image or internal state")
+    atomic_write(report_path, json.dumps(rep, indent=2, ensure_ascii=False).encode("utf8"))
 
 
-def _run_once(opts: RunOptions, engine, kind: str, quiet: bool) -> dict:
-    pipe = Pipeline(opts, engine, kind, progress=not quiet)
+def _run_once(opts, engine, kind: str, quiet: bool, files=None) -> dict:
+    from .pipeline import Pipeline
+    pipe = Pipeline(opts, engine, kind, progress=not quiet, files=files)
     return pipe.run()
 
 
-def _benchmark(opts: RunOptions, repeats: int, quiet: bool) -> int:
+def _benchmark(opts, repeats: int, quiet: bool) -> int:
+    from .pipeline import RunOptions, discover
+    from .safety import atomic_write, check_roots
+    check_roots(opts.input_dir, opts.output_dir.resolve())
+    if repeats < 1:
+        raise ValueError("benchmark repeats must be >= 1")
+    files = discover(opts.input_dir, exclude=opts.output_dir, limit=opts.limit)
+    if not files:
+        raise ValueError("benchmark requires at least one input")
+    import hashlib
+    import tempfile
+    # Explicit file lifetime avoids descriptor accumulation across repeats.
+    def manifest():
+        entries = []
+        for p in files:
+            with p.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            entries.append({"path": str(p.relative_to(opts.input_dir)), "sha256": digest})
+        return entries
+    initial_manifest = manifest()
+    opts.output_dir.mkdir(parents=True, exist_ok=True)
+    run_root = Path(tempfile.mkdtemp(prefix="benchmark-", dir=opts.output_dir))
     results: dict[str, dict] = {}
     engines = []
     try:
-        engines.append(("gpu", GpuEngine()))
+        gpu = GpuEngine(filter_name=opts.filter_name, optimize_huffman=opts.optimize_huffman)
+        ok, msg = gpu.self_test()
+        if not ok:
+            raise RuntimeError(msg)
+        engines.append(("gpu", gpu))
     except Exception as exc:
         print(f"gpu unavailable for benchmark: {exc}")
-    engines.append(("cpu", CpuEngine()))
+    engines.append(("cpu", CpuEngine(opts.filter_name)))
 
     for kind, engine in engines:
         best = None
         runs = []
         for i in range(max(1, repeats)):
             o = RunOptions(**{**opts.__dict__, "output_dir":
-                              opts.output_dir / f"_bench_{kind}_{i}"})
-            rep = _run_once(o, engine, kind, quiet)
+                              run_root / f"{kind}_{i}", "overwrite": True,
+                              "skip_existing": False})
+            before_unchanged = manifest() == initial_manifest
+            rep = _run_once(o, engine, kind, quiet, files=files)
+            rep["benchmark_input_unchanged"] = before_unchanged and manifest() == initial_manifest
+            rep["benchmark_valid"] = (rep["complete"] and rep["processed"] == len(files)
+                                      and rep["benchmark_input_unchanged"])
             runs.append(rep)
-            if best is None or rep["elapsed_sec"] < best["elapsed_sec"]:
+            if rep["benchmark_valid"] and (best is None or rep["elapsed_sec"] < best["elapsed_sec"]):
                 best = rep
-        assert best is not None
-        results[kind] = {**best, "runs": runs}
+        import statistics
+        results[kind] = {**(best or runs[-1]), "runs": runs,
+            "valid": all(r["benchmark_valid"] for r in runs),
+            "median_files_per_sec": statistics.median(r["files_per_sec"] for r in runs),
+            "headline_selection": "best valid run; all repeats and median retained",
+            "cache_state": "hash checks read all inputs outside timing; warm OS cache, not cold IO",
+            "run_root": str(run_root), "input_manifest": initial_manifest}
 
     print()
     print("=" * 68)
@@ -298,17 +353,16 @@ def _benchmark(opts: RunOptions, repeats: int, quiet: bool) -> int:
     for kind, rep in results.items():
         print(f"{kind:<8}{rep['files_per_sec']:>10.1f}"
               f"{rep['elapsed_sec']:>12.2f}{rep['mb_per_sec_in']:>12.1f}")
-    if "gpu" in results and "cpu" in results:
+    if all(k in results and results[k]["valid"] for k in ("gpu", "cpu")):
         speedup = (results["gpu"]["files_per_sec"]
                    / max(1e-9, results["cpu"]["files_per_sec"]))
         print(f"\nGPU speedup: {speedup:.2f}x")
     print("=" * 68)
     path = opts.output_dir / "benchmark.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(results, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
+    atomic_write(path, json.dumps(results, indent=2, ensure_ascii=False).encode("utf8"))
     print(f"Raw results: {path}")
-    return 0
+    return 0 if all(r["valid"] for r in results.values()) else 1
 
 
 def _tkinter_available() -> bool:
@@ -382,7 +436,7 @@ def _launch_gui_elsewhere() -> int:
     return 2
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def _main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.gui:
@@ -402,12 +456,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise SystemExit("error: output folder must differ from the input folder")
 
     opts = _make_options(args, src, dst)
-    engine, kind = _select_engine(args.backend)
-    if kind == "fail":
-        return 2
-
+    from .safety import check_roots, reject_links, STATE_NAME, LOCK_NAME
+    check_roots(opts.input_dir, opts.output_dir.resolve())
+    report_path = Path(args.report).expanduser().absolute() if args.report else opts.output_dir / "report.json"
+    if report_path.suffix.lower() != ".json" or report_path.name in (STATE_NAME, LOCK_NAME):
+        raise ValueError("report must be a separate .json file")
+    if report_path.resolve().is_relative_to(opts.input_dir) and not report_path.absolute().is_relative_to(opts.output_dir):
+        raise ValueError("report must not overwrite a file in the input tree")
+    reject_links(report_path, opts.output_dir if report_path.is_relative_to(opts.output_dir) else report_path.parent)
     if args.benchmark:
         return _benchmark(opts, args.benchmark_repeats, args.quiet)
+    engine, kind = _select_engine(args.backend, opts)
+    if kind == "fail":
+        return 2
 
     spec = OutputSpec(opts.max_w, opts.max_h, opts.mode, opts.quality,
                       opts.subsampling, opts.allow_upscale)
@@ -423,15 +484,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     rep = _run_once(opts, engine, kind, args.quiet)
     rep["wall_sec"] = round(time.perf_counter() - t0, 3)
 
-    report_path = Path(args.report) if args.report else dst / "report.json"
+    report_start = time.perf_counter()
     _write_report(rep, report_path)
+    print(f"Report write : {time.perf_counter() - report_start:.4f} s (not in pipeline elapsed)")
     _print_summary(rep)
     print(f"Report       : {report_path}")
 
     if rep["interrupted"]:
         print("Interrupted: finished files were kept.")
         return 130
-    return 1 if rep["failed"] else 0
+    return 0 if rep["complete"] else 1
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except (ValueError, OSError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

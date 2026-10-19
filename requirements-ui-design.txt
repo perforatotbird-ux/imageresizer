@@ -1,0 +1,5 @@
+# Developer-only offline component generation. Not required by the GUI runtime.
+# Supply the reviewed Tkinter-Designer source checkout to the generation script.
+-r requirements-cpu.txt
+Jinja2>=3.1,<4
+requests>=2.31,<3

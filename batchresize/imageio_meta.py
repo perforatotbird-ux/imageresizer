@@ -21,6 +21,8 @@ class SourceMeta:
     orientation: int = 1
     exif: Optional[bytes] = None
     icc: Optional[bytes] = None
+    mode: str = "RGB"
+    has_alpha: bool = False
 
     @property
     def display_width(self) -> int:
@@ -44,44 +46,65 @@ def read_source_meta(data: bytes) -> SourceMeta:
                 orientation = 1
             if len(exif_obj):
                 exif = exif_obj.tobytes()
-        except Exception:
-            orientation = 1
+        except Exception as exc:
+            raise ValueError("cannot parse source EXIF safely") from exc
         icc = im.info.get("icc_profile")
         if isinstance(icc, str):  # pragma: no cover - defensive
             icc = icc.encode("latin-1", "ignore")
-        return SourceMeta(int(w), int(h), orientation, exif, icc)
+        alpha = "A" in im.getbands() or "transparency" in im.info
+        return SourceMeta(int(w), int(h), orientation, exif, icc, im.mode, alpha)
 
 
 def is_truncated_jpeg(data: bytes) -> bool:
-    """A JPEG that lost its EOI marker was cut off - decoding it yields garbage."""
-    if len(data) < 4 or data[:2] != b"\xff\xd8":
-        return True
-    return data.rfind(b"\xff\xd9", max(0, len(data) - 4096)) == -1
+    """Marker-structure check only, NOT proof of entropy/pixel integrity.
 
-
-def _strip_orientation(exif_bytes: bytes) -> bytes:
-    """Return EXIF with Orientation reset to 1 (pixels are already rotated).
-
-    The returned blob is a bare TIFF block (no ``Exif\\0\\0`` prefix) so the
-    caller can wrap it into an APP1 segment.
+    Skip APP payloads and stuffed entropy bytes, accepting arbitrary trailers.
     """
-    try:
-        import piexif
+    if not data.startswith(b"\xff\xd8"):
+        return True
+    i = 2
+    scan = False
+    while i < len(data):
+        if data[i] != 255:
+            if not scan:
+                return True
+            i += 1
+            continue
+        i += 1
+        while i < len(data) and data[i] == 255:
+            i += 1
+        if i >= len(data):
+            return True
+        marker = data[i]; i += 1
+        if marker == 0 and scan or 0xD0 <= marker <= 0xD7:
+            continue
+        if marker == 0xD9:
+            return not scan
+        if marker in (0xD8, 0x01):
+            continue
+        if i + 2 > len(data):
+            return True
+        n = int.from_bytes(data[i:i+2], "big")
+        if n < 2 or i + n > len(data):
+            return True
+        scan = scan or marker == 0xDA
+        i += n
+    return True
 
-        exif_dict = piexif.load(exif_bytes)
-        ifd0 = exif_dict.get("0th", {})
-        ifd0[ORIENTATION_TAG] = 1
-        # thumbnail is tied to the old orientation - drop it
-        exif_dict["1st"] = {}
-        exif_dict["thumbnail"] = None
-        dumped = piexif.dump(exif_dict)
-        if dumped.startswith(b"Exif\x00\x00"):
-            dumped = dumped[6:]
-        return dumped
-    except Exception:
-        if exif_bytes.startswith(b"Exif\x00\x00"):
-            return exif_bytes[6:]
-        return exif_bytes
+
+def _strip_orientation(exif_bytes: bytes, dimensions=None) -> bytes:
+    """Normalize EXIF or raise; never attach stale orientation on failure."""
+    import piexif
+    ex = piexif.load(exif_bytes)
+    ex.setdefault("0th", {})[ORIENTATION_TAG] = 1
+    ex["1st"] = {}; ex["thumbnail"] = None
+    if dimensions is not None:
+        w, h = dimensions
+        ex["0th"][256] = w; ex["0th"][257] = h
+        ex.setdefault("Exif", {})[40962] = w
+        ex["Exif"][40963] = h
+    blob = piexif.dump(ex)
+    return blob[6:] if blob.startswith(b"Exif\x00\x00") else blob
 
 
 def _icc_chunks(icc: bytes) -> list[bytes]:
@@ -103,7 +126,7 @@ def _app_segment(marker: int, payload: bytes) -> bytes:
 
 
 def splice_metadata(jpeg: bytes, exif: Optional[bytes],
-                    icc: Optional[bytes]) -> bytes:
+                    icc: Optional[bytes], dimensions=None) -> bytes:
     """Insert EXIF/ICC into an encoded JPEG right after SOI.
 
     Any APP1/APP2 segments already present in ``jpeg`` are removed first so
@@ -118,7 +141,7 @@ def splice_metadata(jpeg: bytes, exif: Optional[bytes],
 
     segments = b""
     if exif:
-        payload = b"Exif\x00\x00" + _strip_orientation(exif)
+        payload = b"Exif\x00\x00" + _strip_orientation(exif, dimensions)
         segments += _app_segment(0xE1, payload)
     if icc:
         for chunk in _icc_chunks(icc):
@@ -176,13 +199,10 @@ def webp_has_alpha(data: bytes) -> bool:
     return b"ALPH" in data[:64]
 
 
-def has_alpha_hint(data: bytes, suffix: str) -> bool:
-    s = suffix.lower()
-    if s == ".png":
-        return png_has_alpha(data)
-    if s == ".webp":
-        return webp_has_alpha(data)
-    return False
+def has_alpha_hint(data: bytes, suffix: str = "") -> bool:
+    # Content-based: handles TIFF, LA, RGB/P tRNS and mislabeled extensions.
+    with Image.open(io.BytesIO(data)) as im:
+        return "A" in im.getbands() or "transparency" in im.info
 
 
 def jpeg_dimensions(jpeg: bytes) -> tuple[int, int]:

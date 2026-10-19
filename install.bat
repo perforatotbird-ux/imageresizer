@@ -1,46 +1,27 @@
 @echo off
-setlocal enabledelayedexpansion
-cd /d "%~dp0"
-
-echo === batchresize: install ===
+setlocal EnableExtensions DisableDelayedExpansion
+cd /d "%~dp0" || exit /b 1
 where python >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python 3.10+ not found in PATH.
-    echo Install it from https://www.python.org/downloads/windows/ and re-run.
-    exit /b 1
-)
-
-python -c "import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)"
-if errorlevel 1 (
-    echo ERROR: Python 3.10 or newer is required.
-    exit /b 1
-)
-
-if not exist ".venv\Scripts\python.exe" (
-    echo Creating virtual environment .venv ...
-    python -m venv .venv
-    if errorlevel 1 (
-        echo ERROR: could not create the virtual environment.
-        exit /b 1
-    )
-)
-
-echo Installing dependencies ^(this downloads ~250 MB the first time^) ...
-".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -r requirements.txt
-if errorlevel 1 (
-    echo.
-    echo ERROR: dependency installation failed.
-    echo If you have no NVIDIA GPU you can still use the CPU backend:
-    echo     .venv\Scripts\python.exe -m pip install numpy pillow opencv-python-headless piexif pytest
-    exit /b 1
-)
-
-echo.
-echo === environment check ===
-".venv\Scripts\python.exe" -m batchresize --doctor
-echo.
-echo Done. Try:
-echo     run.bat --doctor
-echo     run.bat -i "D:\Photos" -o "D:\Photos_Resized" --size web_1024 --quality balanced
-endlocal
+if errorlevel 1 goto no_python
+python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
+if errorlevel 1 goto no_python
+if exist ".venv\Scripts\python.exe" goto dependencies
+python -m venv .venv
+if errorlevel 1 exit /b 1
+:dependencies
+set "REQ=requirements.txt"
+if "%~1"=="--cpu" set "REQ=requirements-cpu.txt"
+".venv\Scripts\python.exe" -X utf8 -m pip install -r "%REQ%"
+if errorlevel 1 goto failed
+".venv\Scripts\python.exe" -X utf8 -m batchresize --doctor
+if errorlevel 1 goto failed
+echo Installation and available-engine diagnostics completed.
+echo CPU-only diagnostics do not certify GPU availability. Use run.bat --doctor.
+exit /b 0
+:no_python
+echo ERROR: Python 3.10+ is required. Install a supported python.org build.
+exit /b 1
+:failed
+echo ERROR: Installation or diagnostics failed. Nothing was installed globally.
+echo For CPU-only installation: install.bat --cpu
+exit /b 1

@@ -129,7 +129,7 @@ class GpuInfo:
 
 def _kernel_value(dist: np.ndarray, name: str) -> np.ndarray:
     if name == "box":
-        return np.ones_like(dist, dtype=np.float32)
+        return (np.abs(dist) <= 0.5).astype(np.float32)
     if name == "bilinear":
         d = np.abs(dist)
         return np.clip(1.0 - d, 0.0, None).astype(np.float32)
@@ -160,11 +160,18 @@ def build_weights(src_len: int, dst_len: int, scale: float, offset: float,
     centers = (np.arange(dst_len, dtype=np.float64) + 0.5) / scale - 0.5 + offset
     first = np.floor(centers - support + 0.5).astype(np.int64)
     idx = first[:, None] + np.arange(taps, dtype=np.int64)[None, :]
-    idx = np.clip(idx, 0, src_len - 1).astype(np.int32)
-
     dist = centers[:, None] - idx
     # stretch the kernel when downscaling -> antialiasing
-    w = _kernel_value(dist * min(scale, 1.0), filt)
+    if filt == "box":
+        # Integrate the overlap of each unit source pixel with the output box.
+        half = 0.5 / scale
+        left = centers[:, None] - half
+        right = centers[:, None] + half
+        w = np.maximum(0.0, np.minimum(idx + 0.5, right) -
+                       np.maximum(idx - 0.5, left))
+    else:
+        w = _kernel_value(dist * min(scale, 1.0), filt)
+    idx = np.clip(idx, 0, src_len - 1).astype(np.int32)
     w = w.astype(np.float32)
     s = w.sum(axis=1, keepdims=True)
     s[s == 0] = 1.0
@@ -177,8 +184,11 @@ class GpuEngine:
 
     name = "gpu"
 
-    def __init__(self, filter_name: str = "lanczos3", strict: bool = True,
+    def __init__(self, filter_name: str = "lanczos3", strict: bool = False,
                  max_table_cache: int = 256, optimize_huffman: bool = False):
+        if strict:
+            raise GpuUnavailable("strict GPU-only codec attestation is unsupported; "
+                                 "nvImageCodec automatic routing can use CPU plugins")
         try:
             import cupy as cp
             import nvidia.nvimgcodec as nvimg
@@ -189,6 +199,7 @@ class GpuEngine:
         self.nvimg = nvimg
         self.filter = filter_name
         self.strict = strict
+        self.backend_policy = "nvImageCodec automatic (actual plugin unverified)"
         self.optimize_huffman = optimize_huffman
 
         try:
@@ -218,6 +229,8 @@ class GpuEngine:
         self._table_cache: dict[tuple, tuple] = {}
         self._cache_lock = threading.Lock()
         self._max_cache = max_table_cache
+        self._cache_bytes = 0
+        self._cache_limit = 64 * 2**20
 
         free, total = cp.cuda.runtime.memGetInfo()
         drv = cp.cuda.runtime.driverGetVersion()
@@ -233,6 +246,19 @@ class GpuEngine:
             nvimgcodec_version=str(nv),
             cuda_runtime=f"{rt // 1000}.{(rt % 1000) // 10}",
         )
+
+    def activate(self):
+        """Select the engine device in the worker, not just in its creator."""
+        self.cp.cuda.Device(0).use()
+        self.cp.cuda.Stream.null.use()
+
+    def synchronize(self):
+        self.cp.cuda.Stream.null.synchronize()
+
+    def clear_cache(self):
+        with self._cache_lock:
+            self._table_cache.clear()
+            self._cache_bytes = 0
 
     # -- capabilities --------------------------------------------------------
     def self_test(self) -> tuple[bool, str]:
@@ -271,14 +297,21 @@ class GpuEngine:
         idx, w = build_weights(src_len, dst_len, scale, offset, self.filter)
         dev = (self.cp.asarray(idx), self.cp.asarray(w))
         with self._cache_lock:
-            if len(self._table_cache) >= self._max_cache:
-                self._table_cache.pop(next(iter(self._table_cache)))
-            self._table_cache[key] = dev
+            size = int(idx.nbytes + w.nbytes)
+            while self._table_cache and (len(self._table_cache) >= self._max_cache or
+                                        self._cache_bytes + size > self._cache_limit):
+                old = self._table_cache.pop(next(iter(self._table_cache)))
+                self._cache_bytes -= sum(int(x.nbytes) for x in old)
+            if size <= self._cache_limit:
+                self._table_cache[key] = dev
+                self._cache_bytes += size
         return dev
 
     # -- device helpers ------------------------------------------------------
     def to_device(self, rgb: np.ndarray):
-        return self.cp.asarray(rgb)
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] not in (3, 4):
+            raise ValueError("upload requires packed uint8 RGB/RGBA")
+        return self.cp.asarray(np.ascontiguousarray(rgb))
 
     def apply_orientation(self, arr, orientation: int):
         cp = self.cp
@@ -302,6 +335,9 @@ class GpuEngine:
 
     def alpha_to_rgb(self, arr, bg: tuple[int, int, int]):
         cp = self.cp
+        if arr.dtype != cp.uint8 or arr.ndim != 3 or int(arr.shape[2]) != 4:
+            raise ValueError("alpha composite requires uint8 RGBA")
+        arr = cp.ascontiguousarray(arr)
         h, w = arr.shape[0], arr.shape[1]
         out = cp.empty((h, w, 3), dtype=cp.uint8)
         n = h * w
@@ -341,6 +377,11 @@ class GpuEngine:
 
     def resize(self, src, plan: Plan):
         cp = self.cp
+        if src.dtype != cp.uint8 or src.ndim != 3 or int(src.shape[2]) != 3:
+            raise ValueError("CUDA resize requires uint8 HWC RGB (C3)")
+        src = cp.ascontiguousarray(src)
+        if tuple(src.shape[:2]) != (plan.src_h, plan.src_w):
+            raise ValueError("decoded size differs from oriented geometry")
         if plan.is_identity:
             return cp.ascontiguousarray(src)
 
@@ -386,6 +427,9 @@ class GpuEngine:
         return ep
 
     def encode(self, arr, quality: int, subsampling: int) -> bytes:
+        if arr.dtype != self.cp.uint8 or arr.ndim != 3 or int(arr.shape[2]) != 3:
+            raise ValueError("JPEG encoder requires uint8 RGB")
+        arr = self.cp.ascontiguousarray(arr)
         cs = self._encoder.encode(arr, "jpeg",
                                   params=self._encode_params(quality, subsampling))
         if cs is None:
@@ -394,11 +438,10 @@ class GpuEngine:
 
     # -- public API ----------------------------------------------------------
     def _recycle_decoder_if_needed(self) -> None:
-        """nvImageCodec 0.9 keeps decoder-internal buffers alive.
+        """Best-effort memory-pressure mitigation, not proof of a library leak.
 
-        Each ``decode`` call leaks roughly one batch worth of device memory in
-        the C++ decoder object, so a long run exhausts VRAM. Rebuilding the
-        decoder when free VRAM gets low reclaims it; the object is cheap.
+        Opaque codec allocations and other processes are outside our budget.
+        Rebuilding can stall and is not a hard VRAM bound.
         """
         cp = self.cp
         free, total = cp.cuda.runtime.memGetInfo()
@@ -434,15 +477,7 @@ class GpuEngine:
                     continue
                 result[i] = self.cp.asarray(img)
 
-        # A 4-channel request can fail on decoders that only emit RGB
-        # (WebP/TIFF/PNG via OpenCV extensions). Retry those as RGB.
-        retry = [i for i in rgba_idx if result[i] is None]
-        if retry:
-            imgs = self._decoder.decode([streams[i] for i in retry],
-                                        params=self._decode_rgb)
-            for j, i in enumerate(retry):
-                if imgs[j] is not None:
-                    result[i] = self.cp.asarray(imgs[j])
+        # Do not retry alpha as RGB: callers must use alpha-aware host fallback.
         self.cp.cuda.Stream.null.synchronize()
         return result
 

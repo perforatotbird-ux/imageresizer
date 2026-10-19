@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from .validation import dimensions, positive
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,8 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 def plan_contain(src_w: int, src_h: int, max_w: int, max_h: int,
                  allow_upscale: bool = False) -> Plan:
     """Fit inside the box, keep aspect, never crop."""
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError("empty image")
+    dimensions(src_w, src_h)
+    dimensions(max_w, max_h)
     scale = min(max_w / src_w, max_h / src_h)
     if scale > 1.0 and not allow_upscale:
         scale = 1.0
@@ -73,8 +74,8 @@ def plan_cover(src_w: int, src_h: int, max_w: int, max_h: int,
     upscaled unless ``allow_upscale`` is explicitly disabled (then the
     result is the largest centred crop that does not upscale).
     """
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError("empty image")
+    dimensions(src_w, src_h)
+    dimensions(max_w, max_h)
     scale = max(max_w / src_w, max_h / src_h)
     if scale > 1.0 and not allow_upscale:
         scale = 1.0
@@ -111,13 +112,16 @@ def compute_box(src_w: int, src_h: int, sizing: str, max_w: int, max_h: int,
     * ``longest``    - make the longest side ``value`` pixels
     * ``shortest``   - make the shortest side ``value`` pixels
     """
+    dimensions(src_w, src_h)
+    dimensions(max_w, max_h)
     if sizing in ("", "resolution", None):
         return max_w, max_h
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError("empty image")
+    positive(value, "sizing value")
+    dimensions(src_w, src_h)
+    dimensions(max_w, max_h)
 
     if sizing == "percent":
-        scale = max(0.001, value / 100.0)
+        scale = value / 100.0
     elif sizing == "megapixels":
         target_px = max(1.0, value * 1_000_000.0)
         scale = (target_px / float(src_w * src_h)) ** 0.5
@@ -130,4 +134,5 @@ def compute_box(src_w: int, src_h: int, sizing: str, max_w: int, max_h: int,
 
     box_w = max(1, int(round(src_w * scale)))
     box_h = max(1, int(round(src_h * scale)))
+    dimensions(box_w, box_h)
     return box_w, box_h

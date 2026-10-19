@@ -1,0 +1,5 @@
+# CPU runtime only. Tests are a separate development dependency.
+numpy>=2.0,<3
+pillow>=11.0,<14
+opencv-python-headless>=4.10,<6
+piexif==1.1.3

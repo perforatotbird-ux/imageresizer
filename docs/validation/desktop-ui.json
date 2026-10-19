@@ -1,0 +1,40 @@
+{
+  "base_commit": "f4f0782de06aaec63d44486e711cbc8dde349e80",
+  "full_suite": {
+    "passed": 153,
+    "skipped": 24,
+    "failed": 0,
+    "seconds": 11.26,
+    "skips": "NVIDIA/CUDA unavailable"
+  },
+  "new_GUI_cases": 18,
+  "platform": "Linux, Python 3.13.16, Tk 8.6.13 Xft, Xvfb; CPU pipeline dependencies from audit venv",
+  "visual_states": [
+    "folders",
+    "resize",
+    "JPEG",
+    "engine",
+    "scrolled lower sections",
+    "1060x740",
+    "expanded log",
+    "error",
+    "144dpi actual separate Xvfb display"
+  ],
+  "test_data": "synthetic images only; no personal photos",
+  "verified_GUI_operations": [
+    "real CPU processing and verified resume",
+    "quality presets",
+    "live summary",
+    "readonly controls during work",
+    "UTF-8 child IPC",
+    "cooperative cancel",
+    "close after child exit",
+    "lightweight import without site-packages"
+  ],
+  "Windows_CUDA_acceptance": false,
+  "remaining_guarantees": [
+    "IR-17 entropy-integrity certificate not implemented",
+    "IR-18 hard native RSS/VRAM cap not implemented",
+    "IR-26 GPU-only codec attestation not implemented"
+  ]
+}

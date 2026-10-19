@@ -1,0 +1,7 @@
+# Reproduction constraints for the tested Linux/Python 3.13 environment only.
+# Not a cross-platform wheel lock; CUDA/Windows packages not certified here.
+numpy==2.5.3
+pillow==12.3.0
+opencv-python-headless==5.0.0.93
+piexif==1.1.3
+pytest==9.1.1

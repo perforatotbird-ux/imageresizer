@@ -7,7 +7,7 @@ from typing import Optional
 
 # --- size presets -----------------------------------------------------------
 # Values are interpreted as the maximum width/height for `contain`
-# and as the exact target box for `cover`.
+# and as the desired target box for `cover` (smaller if upscaling is off).
 SIZE_PRESETS: dict[str, tuple[int, int]] = {
     "thumb_256": (256, 256),
     "small_512": (512, 512),
@@ -55,7 +55,7 @@ QUALITY_LABELS: dict[str, str] = {
 
 # XL Converter style: default chroma depends on quality and source.
 SUBSAMPLING_LABELS: dict[str, str] = {
-    "auto": "Default - 4:4:4 up to q85, then matches the source",
+    "auto": "Auto - 4:2:0 to q85, 4:2:2 to q94, then 4:4:4",
     "444": "4:4:4 - full colour, highest quality and size",
     "422": "4:2:2 - less colour, significant space saving",
     "420": "4:2:0 - colours may appear washed out",

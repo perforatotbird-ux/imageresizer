@@ -1,0 +1,293 @@
+{
+  "format": "Figma REST node subset, created locally; not a .fig file",
+  "generator_commit": "61ce0665ce68e255fd8bead3c14aac6c877bfa05",
+  "components": [
+    {
+      "class_name": "DesignerBrand",
+      "node": {
+        "id": "DesignerBrand",
+        "type": "FRAME",
+        "name": "DesignerBrand",
+        "absoluteBoundingBox": {
+          "x": 0,
+          "y": 0,
+          "width": 216,
+          "height": 112
+        },
+        "fills": [
+          {
+            "type": "SOLID",
+            "color": {
+              "r": 0.0784313725490196,
+              "g": 0.12549019607843137,
+              "b": 0.20784313725490197
+            }
+          }
+        ],
+        "children": [
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 24,
+              "y": 25,
+              "width": 36,
+              "height": 36
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.2235294117647059,
+                  "g": 0.48627450980392156,
+                  "b": 0.9647058823529412
+                }
+              }
+            ],
+            "cornerRadius": 9
+          },
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 33,
+              "y": 34,
+              "width": 18,
+              "height": 18
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 1.0,
+                  "g": 1.0,
+                  "b": 1.0
+                }
+              }
+            ],
+            "cornerRadius": 3
+          },
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 36,
+              "y": 37,
+              "width": 12,
+              "height": 12
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.2235294117647059,
+                  "g": 0.48627450980392156,
+                  "b": 0.9647058823529412
+                }
+              }
+            ],
+            "cornerRadius": 1
+          },
+          {
+            "id": "Product",
+            "type": "TEXT",
+            "name": "Product",
+            "absoluteBoundingBox": {
+              "x": 73,
+              "y": 29,
+              "width": 140,
+              "height": 26
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 1.0,
+                  "g": 1.0,
+                  "b": 1.0
+                }
+              }
+            ],
+            "characters": "imageresizer",
+            "style": {
+              "fontFamily": "Segoe UI",
+              "fontSize": 19,
+              "fontWeight": 700
+            }
+          },
+          {
+            "id": "Tagline",
+            "type": "TEXT",
+            "name": "Tagline",
+            "absoluteBoundingBox": {
+              "x": 24,
+              "y": 80,
+              "width": 190,
+              "height": 20
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.6666666666666666,
+                  "g": 0.7176470588235294,
+                  "b": 0.8117647058823529
+                }
+              }
+            ],
+            "characters": "ПАКЕТНАЯ ОБРАБОТКА",
+            "style": {
+              "fontFamily": "Segoe UI",
+              "fontSize": 10,
+              "fontWeight": 600
+            }
+          }
+        ]
+      }
+    },
+    {
+      "class_name": "DesignerDiagram",
+      "node": {
+        "id": "DesignerDiagram",
+        "type": "FRAME",
+        "name": "DesignerDiagram",
+        "absoluteBoundingBox": {
+          "x": 0,
+          "y": 0,
+          "width": 232,
+          "height": 116
+        },
+        "fills": [
+          {
+            "type": "SOLID",
+            "color": {
+              "r": 1.0,
+              "g": 1.0,
+              "b": 1.0
+            }
+          }
+        ],
+        "children": [
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 0,
+              "y": 0,
+              "width": 232,
+              "height": 116
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.9490196078431372,
+                  "g": 0.9647058823529412,
+                  "b": 1.0
+                }
+              }
+            ],
+            "cornerRadius": 12
+          },
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 35,
+              "y": 18,
+              "width": 162,
+              "height": 81
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.8470588235294118,
+                  "g": 0.9019607843137255,
+                  "b": 1.0
+                }
+              }
+            ],
+            "cornerRadius": 8
+          },
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 57,
+              "y": 28,
+              "width": 118,
+              "height": 60
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 1.0,
+                  "g": 1.0,
+                  "b": 1.0
+                }
+              }
+            ],
+            "cornerRadius": 5
+          },
+          {
+            "id": "Rectangle",
+            "type": "RECTANGLE",
+            "name": "Rectangle",
+            "absoluteBoundingBox": {
+              "x": 66,
+              "y": 34,
+              "width": 100,
+              "height": 47
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.6039215686274509,
+                  "g": 0.7490196078431373,
+                  "b": 0.9803921568627451
+                }
+              }
+            ],
+            "cornerRadius": 2
+          },
+          {
+            "id": "Arrow",
+            "type": "TEXT",
+            "name": "Arrow",
+            "absoluteBoundingBox": {
+              "x": 93,
+              "y": 40,
+              "width": 48,
+              "height": 35
+            },
+            "fills": [
+              {
+                "type": "SOLID",
+                "color": {
+                  "r": 0.09019607843137255,
+                  "g": 0.2901960784313726,
+                  "b": 0.611764705882353
+                }
+              }
+            ],
+            "characters": "↗",
+            "style": {
+              "fontFamily": "Segoe UI",
+              "fontSize": 28,
+              "fontWeight": 600
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
