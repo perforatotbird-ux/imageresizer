@@ -56,10 +56,10 @@ def test_unknown_fields_are_rejected_with_a_path():
 
 @pytest.mark.parametrize("path,value,message", [
     (("fit", "mode"), "pad", "not supported"),
-    (("sharpen", "enabled"), True, "not supported"),
+    (("sharpen", "amount"), -1.0, "between 0.0 and 10.0"),
     (("color", "policy"), "srgb", "only 'preserve'"),
     (("format",), "png", "only JPEG"),
-    (("filter",), "nearest", "must be box"),
+    (("filter",), "unsupported_filter", "must be one of"),
     (("jpeg", "quality"), 0, "between 1 and 100"),
     (("jpeg", "subsampling"), "411", "must be auto"),
 ])
@@ -71,6 +71,15 @@ def test_unsupported_values_are_rejected(path, value, message):
     target[path[-1]] = value
     with pytest.raises(profiles.ProfileError, match=message):
         profiles.parse_profile(data)
+
+
+def test_stage4_values_are_accepted():
+    data = builtin("builtin-web-photo").to_dict()
+    data["filter"] = "nearest"
+    data["sharpen"] = {"enabled": True, "preset": "standard", "amount": 1.2, "radius": 1.0, "threshold": 2}
+    profile = profiles.parse_profile(data)
+    assert profile.filter == "nearest"
+    assert profile.sharpen["enabled"] is True
 
 
 def test_resolution_requires_both_dimensions():

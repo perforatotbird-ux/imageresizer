@@ -125,12 +125,17 @@ def _validate_fit(value) -> dict:
 
 
 def _validate_sharpen(value) -> dict:
-    data = _mapping(value, "sharpen", {"enabled", "amount"})
-    enabled = _bool(data.get("enabled", False), "sharpen.enabled")
-    amount = _number(data.get("amount", 0.0), "sharpen.amount", 0.0, 5.0)
-    if enabled:
-        _fail("sharpen.enabled", "output sharpening is not supported by this version")
-    return {"enabled": False, "amount": amount}
+    from .sharpen import SharpenError, parse_sharpen
+    if isinstance(value, bool):
+        value = {"enabled": value}
+    elif isinstance(value, str):
+        value = {"preset": value, "enabled": value != "off"}
+    data = _mapping(value, "sharpen", {"enabled", "preset", "amount", "radius", "threshold"})
+    try:
+        cfg = parse_sharpen(data)
+    except SharpenError as exc:
+        _fail("sharpen", str(exc))
+    return cfg.to_dict()
 
 
 def _validate_colour(value) -> dict:
@@ -222,8 +227,9 @@ def parse_profile(data: dict, *, builtin: bool = False) -> "Profile":
     if "jpeg" not in data:
         _fail("jpeg", "is required")
     filter_name = data.get("filter", "lanczos3")
-    if filter_name not in ("box", "bilinear", "lanczos3"):
-        _fail("filter", "must be box, bilinear or lanczos3")
+    from .resampling import SUPPORTED_FILTERS
+    if filter_name not in SUPPORTED_FILTERS:
+        _fail("filter", f"must be one of {', '.join(SUPPORTED_FILTERS)}")
     output_format = data.get("format", "jpeg")
     if output_format != "jpeg":
         _fail("format", "only JPEG output is supported by this version")

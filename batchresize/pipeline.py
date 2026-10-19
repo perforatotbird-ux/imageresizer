@@ -65,6 +65,7 @@ class RunOptions:
     profile_cuda: bool = False
     cancel_file: Optional[Path] = None
     variants: tuple[OutputVariant, ...] = ()
+    sharpen: Any = None
 
     def __post_init__(self):
         self.variants = tuple(self.variants)
@@ -90,8 +91,12 @@ class RunOptions:
                 not 1 <= self.quality <= 100 or isinstance(self.subsampling, bool) or
                 self.subsampling not in (0, 1, 2)):
             raise ValueError("invalid JPEG quality/subsampling")
-        if self.filter_name not in ("box", "bilinear", "lanczos3"):
+        from .resampling import SUPPORTED_FILTERS
+        if self.filter_name not in SUPPORTED_FILTERS:
             raise ValueError("unknown filter")
+        from .sharpen import SharpenConfig, parse_sharpen
+        if not isinstance(self.sharpen, SharpenConfig):
+            object.__setattr__(self, "sharpen", parse_sharpen(self.sharpen))
         if len(self.bg_color) != 3 or any(int(x) != x or not 0 <= x <= 255 for x in self.bg_color):
             raise ValueError("background must contain three bytes")
         for name in ("max_source_bytes", "max_queued_bytes", "max_working_bytes"):
@@ -750,6 +755,9 @@ class Pipeline:
                 try:
                     t3 = time.perf_counter()
                     small = engine.resize(img, task.plan)
+                    if self.opts.sharpen.enabled:
+                        from .sharpen import apply_sharpen
+                        small = apply_sharpen(small, self.opts.sharpen)
                     t4 = time.perf_counter()
                     jpeg = engine.encode(small, task.quality, task.subsampling)
                     t5 = time.perf_counter()
@@ -787,6 +795,10 @@ class Pipeline:
                 self._gpu_fallback(batch[0], RuntimeError(error))
 
     def _process_gpu_batch_inner(self, batch):
+        if self.opts.sharpen.enabled:
+            for job in batch:
+                self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
+            return
         # Managed colour conversion cannot copy a CMYK/gray profile onto RGB.
         managed = [j for j in batch if j.meta.icc and j.meta.mode not in ("RGB", "RGBA", "P")]
         for job in managed:
@@ -842,6 +854,9 @@ class Pipeline:
         self._process_gpu_batch([job])
 
     def _process_hybrid_one(self, job):
+        if self.opts.sharpen.enabled:
+            self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
+            return
         try:
             with self._working(job):
                 self._process_hybrid_inner(job)
@@ -1008,6 +1023,7 @@ class Pipeline:
         config = {k: getattr(opts, k) for k in ("max_w", "max_h", "mode", "quality",
             "subsampling", "sizing", "sizing_value", "allow_upscale", "filter_name",
             "bg_color", "keep_exif", "keep_icc", "optimize_huffman")}
+        config["sharpen"] = opts.sharpen.to_dict()
         from . import __version__
         from importlib.metadata import version, PackageNotFoundError
         versions = {}
@@ -1165,6 +1181,8 @@ class Pipeline:
             "output": str(self.opts.output_dir),
             "backend": self.backend,
             "engine": self.backend,
+            "filter": self.opts.filter_name,
+            "sharpen": self.opts.sharpen.to_dict(),
             "discovered": self.discovered,
             "sources_total": self.discovered,
             "sources_complete": sources_complete,

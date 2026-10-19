@@ -125,9 +125,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "--skip-existing is given)")
     p.add_argument("--allow-upscale", action="store_true",
                    help="allow enlarging small photos")
+    from .resampling import SUPPORTED_FILTERS
     p.add_argument("--filter", default="lanczos3",
-                   choices=["lanczos3", "bilinear", "box"],
+                   choices=list(SUPPORTED_FILTERS),
                    help="resampling filter")
+    p.add_argument("--sharpen", default=None,
+                   choices=["off", "weak", "standard"],
+                   help="output sharpening preset (luminance Unsharp Mask)")
+    p.add_argument("--sharpen-amount", type=float, default=None,
+                   help="sharpening amount multiplier (e.g. 0.5 .. 2.0)")
+    p.add_argument("--sharpen-radius", type=float, default=None,
+                   help="sharpening blur radius/sigma in pixels")
+    p.add_argument("--sharpen-threshold", type=int, default=None,
+                   help="sharpening tonal difference threshold 0..255")
     p.add_argument("--bg-color", default="#FFFFFF",
                    help="background for transparent images")
     p.add_argument("--no-exif", action="store_true",
@@ -302,6 +312,27 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         raise SystemExit("error: --queue-depth must be >= 1")
 
     overwrite = args.overwrite or not args.skip_existing
+    from .sharpen import SharpenConfig, parse_sharpen
+    has_sharpen_args = (getattr(args, "sharpen", None) is not None or
+                        any(getattr(args, k, None) is not None for k in
+                            ("sharpen_amount", "sharpen_radius", "sharpen_threshold")))
+    if has_sharpen_args:
+        if args.sharpen in ("off", None) and not any(getattr(args, k, None) is not None for k in
+                                                     ("sharpen_amount", "sharpen_radius", "sharpen_threshold")):
+            sharpen_cfg = SharpenConfig(enabled=False, preset="off")
+        else:
+            base = SharpenConfig.from_preset(args.sharpen if args.sharpen in ("weak", "standard") else "standard")
+            amount = args.sharpen_amount if getattr(args, "sharpen_amount", None) is not None else base.amount
+            radius = args.sharpen_radius if getattr(args, "sharpen_radius", None) is not None else base.radius
+            threshold = args.sharpen_threshold if getattr(args, "sharpen_threshold", None) is not None else base.threshold
+            is_custom = any(getattr(args, k, None) is not None for k in ("sharpen_amount", "sharpen_radius", "sharpen_threshold"))
+            sharpen_cfg = SharpenConfig(enabled=True, preset="custom" if is_custom else args.sharpen,
+                                        amount=amount, radius=radius, threshold=threshold)
+    elif profile is not None and getattr(profile, "sharpen", None):
+        sharpen_cfg = parse_sharpen(profile.sharpen)
+    else:
+        sharpen_cfg = SharpenConfig(enabled=False, preset="off")
+
     return RunOptions(
         input_dir=src,
         output_dir=dst,
@@ -331,6 +362,7 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         profile_cuda=args.profile_cuda,
         cancel_file=Path(os.environ["BATCHRESIZE_CANCEL_FILE"]) if os.environ.get("BATCHRESIZE_CANCEL_FILE") else None,
         variants=tuple(variants),
+        sharpen=sharpen_cfg,
     )
 
 

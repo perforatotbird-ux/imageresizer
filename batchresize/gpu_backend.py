@@ -149,34 +149,8 @@ def build_weights(src_len: int, dst_len: int, scale: float, offset: float,
     ``scale`` is dst/src, ``offset`` is the source-space origin of the region
     being resampled (used by the ``cover`` crop).
     """
-    if filt == "box":
-        support = 0.5 / min(scale, 1.0)
-    elif filt == "bilinear":
-        support = 1.0 / min(scale, 1.0)
-    else:
-        support = 3.0 / min(scale, 1.0)
-
-    taps = int(math.ceil(support * 2.0)) + 1
-    centers = (np.arange(dst_len, dtype=np.float64) + 0.5) / scale - 0.5 + offset
-    first = np.floor(centers - support + 0.5).astype(np.int64)
-    idx = first[:, None] + np.arange(taps, dtype=np.int64)[None, :]
-    dist = centers[:, None] - idx
-    # stretch the kernel when downscaling -> antialiasing
-    if filt == "box":
-        # Integrate the overlap of each unit source pixel with the output box.
-        half = 0.5 / scale
-        left = centers[:, None] - half
-        right = centers[:, None] + half
-        w = np.maximum(0.0, np.minimum(idx + 0.5, right) -
-                       np.maximum(idx - 0.5, left))
-    else:
-        w = _kernel_value(dist * min(scale, 1.0), filt)
-    idx = np.clip(idx, 0, src_len - 1).astype(np.int32)
-    w = w.astype(np.float32)
-    s = w.sum(axis=1, keepdims=True)
-    s[s == 0] = 1.0
-    w /= s
-    return idx, w
+    from .resampling import build_separable_weights
+    return build_separable_weights(src_len, dst_len, scale, offset, filt)
 
 
 class GpuEngine:

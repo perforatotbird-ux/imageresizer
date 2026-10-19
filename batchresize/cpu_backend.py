@@ -82,22 +82,8 @@ class CpuEngine:
 
     # -- resize --------------------------------------------------------------
     def resize(self, img: np.ndarray, plan: Plan) -> np.ndarray:
-        from PIL import Image
-        from .validation import dimensions
-        dimensions(plan.out_w, plan.out_h)
-        if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
-            raise ValueError("resize requires uint8 BGR with three channels")
-        if plan.is_identity:
-            return np.ascontiguousarray(img)
-        filters = {"lanczos3": Image.Resampling.LANCZOS,
-                   "bilinear": Image.Resampling.BILINEAR,
-                   "box": Image.Resampling.BOX}
-        if self.filter not in filters:
-            raise ValueError(f"unknown filter {self.filter!r}")
-        rgb = Image.fromarray(np.ascontiguousarray(img[:, :, ::-1]))
-        box = (plan.x0, plan.y0, plan.x0 + plan.cw, plan.y0 + plan.ch)
-        out = rgb.resize((plan.out_w, plan.out_h), filters[self.filter], box=box)
-        return np.ascontiguousarray(np.asarray(out)[:, :, ::-1])
+        from .resampling import resample_cpu
+        return resample_cpu(img, plan, self.filter)
 
     # -- encode --------------------------------------------------------------
     @staticmethod

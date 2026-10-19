@@ -289,7 +289,7 @@ class ModernView:
             self.control(ttk.Radiobutton(p,text=text,variable=a.mode_var,value=val)).grid(row=row,column=0,sticky='w')
         self.check(p,13,'Разрешить увеличение маленьких фото',a.allow_upscale_var)
         self.label(p,14,'Фильтр ресайза')
-        self.combo(p,15,['lanczos3','bilinear','box'],a.filter_var)
+        self.combo(p,15,['lanczos3','mitchell','area','bilinear','nearest','box'],a.filter_var)
         ttk.Label(p,text='Без увеличения cover может дать результат меньше заданных границ.',style='Muted.TLabel',wraplength=380).grid(row=16,column=0,sticky='w',pady=(12,0))
 
     def _jpeg(self,p):

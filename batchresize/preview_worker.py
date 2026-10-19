@@ -128,6 +128,7 @@ class PreviewService:
                 optimize_huffman=bool(params.get("optimize_huffman", False)),
                 fsync=False,
                 profile_cuda=False,
+                sharpen=params.get("sharpen"),
             )
             engine, kind = self._engine_for(
                 backend, opts.filter_name, opts.optimize_huffman)
