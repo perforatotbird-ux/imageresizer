@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-19",
+  "branch": "feature/mvp-0-3",
+  "base_commit": "d36cf7e",
+  "platform": "Windows 10 10.0.19045, 24 logical cores, 15.8 GiB RAM",
+  "python": {
+    "venv": "3.13.14",
+    "system": "3.10.11",
+    "note": "tkinter is available in system Python 3.10 but not in .venv; GUI tests are skipped under .venv"
+  },
+  "packages": {
+    "numpy": "2.5.4",
+    "pillow": "13.0.0",
+    "opencv-python-headless": "5.0.0.93",
+    "piexif": "1.1.3",
+    "cupy-cuda12x": "14.2.0",
+    "nvidia-nvimgcodec-cu12": "0.9.0.20"
+  },
+  "engines": {
+    "cpu": "OK (OpenCV 5.0.0)",
+    "gpu": "OK (NVIDIA GeForce GTX 1060 6GB, SM 6.1, CUDA runtime 12.9)",
+    "doctor": "PASS; cuDevicePrimaryCtxRelease failed: 4 is CuPy/nvImageCodec shutdown noise"
+  },
+  "full_suite": {
+    "command": ".venv\\Scripts\\python.exe -X utf8 -m pytest -q",
+    "passed": 159,
+    "failed": 1,
+    "skipped": 2,
+    "seconds": 47.4,
+    "failure": "tests/test_audit_regressions.py::test_IR01_output_links_rejected - OSError WinError 1314 (symlink privilege), environment limitation",
+    "skips": "GUI tests require tkinter, absent from .venv"
+  },
+  "cli_checks": [
+    {
+      "purpose": "clean fixture set from another working directory",
+      "command": "python -m batchresize -i testdata\\photos -o testdata\\out-baseline --backend cpu --limit 12 --jpeg-quality 80 --report ... --quiet",
+      "discovered": 12,
+      "processed": 11,
+      "failed": 1,
+      "result": "expected rejection of corrupt.jpg (truncated JPEG); exit code 1"
+    },
+    {
+      "purpose": "Unicode and spaces in paths",
+      "command": "python -m batchresize -i testdata\\photos\\Семья 2024 -o 'testdata\\out unicode' ...",
+      "discovered": 1,
+      "processed": 1,
+      "failed": 0,
+      "result": "PASS"
+    }
+  ],
+  "fixtures": {
+    "generator": "tools/make_testset.py",
+    "count": 34,
+    "bytes": 47815065,
+    "coverage": [
+      "RGB JPEG/PNG/BMP/TIFF/WebP",
+      "grayscale JPEG/PNG",
+      "CMYK JPEG",
+      "RGBA PNG/TIFF",
+      "progressive JPEG",
+      "EXIF Orientation 1-8",
+      "EXIF + ICC",
+      "corrupt, non-image and truncated-tail JPEG",
+      "Unicode and spaces in directory/file names",
+      "nested folders, name clash, tiny/panorama/tower sizes"
+    ]
+  },
+  "known_issues": [
+    "The .venv interpreter has no tkinter, so GUI windows cannot be launched with run.bat as-is; system Python 3.10 has Tk 8.6.",
+    "The symlink regression test needs Windows Developer Mode or elevated privileges."
+  ]
+}

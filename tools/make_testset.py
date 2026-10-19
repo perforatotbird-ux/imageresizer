@@ -85,6 +85,26 @@ def main() -> None:
     gradient(1600, 1200, seed=25).save(ROOT / "Mixed" / "web.webp", quality=90)
     n += 5
 
+    # --- colour modes -----------------------------------------------------
+    gray = gradient(1200, 800, seed=51).convert("L")
+    gray.save(ROOT / "Mixed" / "gray.jpg", "JPEG", quality=90)
+    gray.save(ROOT / "Mixed" / "gray.png")
+    gradient(1200, 800, seed=52).convert("CMYK").save(
+        ROOT / "Mixed" / "cmyk.jpg", "JPEG", quality=90)
+    rgba = gradient(900, 600, seed=53, alpha=True)
+    rgba.save(ROOT / "Mixed" / "rgba.png")
+    rgba.save(ROOT / "Mixed" / "rgba.tiff")
+    gradient(1600, 1000, seed=54).save(
+        ROOT / "Mixed" / "progressive.jpg", "JPEG", quality=90, progressive=True)
+    n += 6
+
+    # --- unicode and spaces in paths --------------------------------------
+    unicode_dir = ROOT / "Семья 2024"
+    unicode_dir.mkdir(exist_ok=True)
+    gradient(1920, 1280, seed=61).save(
+        unicode_dir / "Портрет 01.jpg", "JPEG", quality=92)
+    n += 1
+
     # --- name clash: photo.png and photo.jpg in the same folder -----------
     gradient(900, 700, seed=31).save(ROOT / "Mixed" / "photo.jpg", "JPEG", quality=90)
     n += 1  # photo.png already counted above
@@ -114,7 +134,8 @@ def main() -> None:
     good = (ROOT / "Mixed" / "photo.jpg").read_bytes()
     (ROOT / "Mixed" / "corrupt.jpg").write_bytes(good[: len(good) // 3])
     (ROOT / "Mixed" / "not_an_image.jpg").write_bytes(b"this is not a jpeg" * 10)
-    n += 2
+    (ROOT / "Mixed" / "truncated_tail.jpg").write_bytes(good[:-2])
+    n += 3
 
     total = sum(p.stat().st_size for p in ROOT.rglob("*") if p.is_file())
     print(f"created {n} images in {ROOT} ({total / 2 ** 20:.1f} MiB)")
