@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+out_gpu/
+out_cpu/
+bench_out/
+bench_thumb_256/
+bench_large_1600/
+tune_out/
+testdata/
+.bench_tmp_*
+.bench_tmp_*
+
+# working folders (photos and results stay local)
+input/
+output/
+.workbuddy-ai/
+report.json

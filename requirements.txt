@@ -1,0 +1,18 @@
+# Core (CPU fallback + metadata + tests)
+numpy>=2.0
+pillow>=11.0
+opencv-python-headless>=4.10
+piexif>=1.1.3
+pytest>=8.0
+
+# GPU path: CUDA 12 python stack
+cupy-cuda12x>=14.0
+nvidia-nvjpeg-cu12>=12.4
+nvidia-nvimgcodec-cu12>=0.9.0
+
+# CUDA headers + NVRTC for CuPy's runtime kernel compilation (RawKernel).
+# On a machine with a full CUDA Toolkit installed you can skip these three
+# and set CUDA_PATH instead.
+nvidia-cuda-runtime-cu12>=12.4
+nvidia-cuda-nvcc-cu12>=12.4
+nvidia-cuda-nvrtc-cu12>=12.4
