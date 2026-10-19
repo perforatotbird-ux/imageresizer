@@ -25,6 +25,8 @@ from .safety import (atomic_write, check_roots, path_key, protect_target,
 from .geometry import Plan, compute_box, make_plan
 from .imageio_meta import (SourceMeta, has_alpha_hint, is_truncated_jpeg,
                            read_source_meta, splice_metadata)
+from .presets import SUBSAMPLING_NAMES, auto_subsampling
+from .variants import OutputVariant
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -62,8 +64,12 @@ class RunOptions:
     max_working_bytes: int = 1024 * 2**20
     profile_cuda: bool = False
     cancel_file: Optional[Path] = None
+    variants: tuple[OutputVariant, ...] = ()
 
     def __post_init__(self):
+        self.variants = tuple(self.variants)
+        if len({variant.id for variant in self.variants}) != len(self.variants):
+            raise ValueError("duplicate output variant id")
         self.input_dir = Path(self.input_dir).resolve()
         self.output_dir = Path(self.output_dir).absolute()
         dimensions(self.max_w, self.max_h)
@@ -96,6 +102,16 @@ class RunOptions:
             raise ValueError("source byte limit exceeds queued byte budget")
 
 
+@dataclass(frozen=True)
+class OutputTask:
+    variant_id: Optional[str]
+    out: Path
+    plan: Plan
+    quality: int
+    subsampling: int
+    config_digest: str
+
+
 @dataclass
 class Job:
     src: Path
@@ -105,16 +121,20 @@ class Job:
     plan: Plan
     has_alpha: bool = False
     digest: str = ""
+    outputs: tuple[OutputTask, ...] = ()
 
 
 @dataclass
 class Result:
     job: Job
     jpeg: bytes
+    out: Path
     out_w: int
     out_h: int
     backend: str
     timings: dict = field(default_factory=dict)
+    variant_id: Optional[str] = None
+    plan: Optional[Plan] = None
 
 
 class Stats:
@@ -135,10 +155,11 @@ class Stats:
         self.read_count = 0
         self.backend_counts = {}
         self.extra_timings = {}
+        self._counted_sources: set[Path] = set()
 
-    def error(self, path: Path, exc: BaseException) -> None:
+    def error(self, path: Path, exc: BaseException, count: int = 1) -> None:
         with self.lock:
-            self.failed += 1
+            self.failed += count
             if len(self.errors) < 50:
                 self.errors.append((str(path), f"{type(exc).__name__}: {exc}"))
 
@@ -154,7 +175,9 @@ class Stats:
             for key, val in res.timings.items():
                 if key not in ("decode", "resize", "encode"):
                     self.extra_timings[key] = self.extra_timings.get(key, 0) + val
-            self.bytes_in += len(res.job.data)
+            if res.job.src not in self._counted_sources:
+                self._counted_sources.add(res.job.src)
+                self.bytes_in += len(res.job.data)
             self.bytes_out += len(res.jpeg)
             self.t_decode += res.timings.get("decode", 0.0)
             self.t_resize += res.timings.get("resize", 0.0)
@@ -300,6 +323,9 @@ class Pipeline:
                  progress: bool = True, on_progress=None, files=None) -> None:
         self.opts = opts
         self._fixed_files = list(files) if files is not None else None
+        if engine is None and backend == "cpu":
+            from .cpu_backend import CpuEngine
+            engine = CpuEngine(opts.filter_name)
         self.engine = engine
         self.backend = backend
         self.stats = Stats()
@@ -318,6 +344,12 @@ class Pipeline:
         self._sources = set()
         self._identities = set()
         self._resume = None
+        self._variant_digests: dict[str, str] = {}
+        self._variant_maps: dict[str, dict[Path, Path]] = {}
+        self._targets_by_source: dict[Path, dict[Optional[str], Path]] = {}
+        self._expected: set[tuple[Path, Optional[str]]] = set()
+        self._remaining: dict[Path, int] = {}
+        self._outputs_total = 0
         self.scan_seconds = 0.0
         self.on_progress = on_progress
         self.jobs: queue.Queue = queue.Queue(maxsize=max(1, opts.queue_depth))
@@ -350,12 +382,51 @@ class Pipeline:
 
     # -- queue helpers -------------------------------------------------------
     def _fail(self, path, exc):
+        self._fail_source(path, exc)
+
+    def _fail_source(self, path, exc):
         with self._state_lock:
-            if path in self._terminal:
-                return
-            self._terminal.add(path)
-        self.stats.error(path, exc)
+            keys = [key for key in self._expected
+                    if key[0] == path and key not in self._terminal]
+            if not keys:
+                key = (path, None)
+                if key not in self._terminal:
+                    self._terminal.add(key)
+                    keys = [key]
+            for key in keys:
+                self._terminal.add(key)
+            self._remaining[path] = 0
+        if keys:
+            self.stats.error(path, exc, len(keys))
         self._release_source(path)
+
+    def _fail_output(self, job, task, exc):
+        key = (job.src, task.variant_id)
+        with self._state_lock:
+            if key in self._terminal:
+                return
+            self._terminal.add(key)
+        label = str(job.src)
+        if task.variant_id is not None:
+            label = f"{label} [{task.variant_id}]"
+        self.stats.error(label, exc)
+
+    def _mark_skipped(self, job, task):
+        key = (job.src, task.variant_id)
+        with self._state_lock:
+            if key in self._terminal:
+                return
+            self._terminal.add(key)
+        with self.stats.lock:
+            self.stats.skipped += 1
+        self._complete_output(job.src)
+
+    def _complete_output(self, path):
+        with self._state_lock:
+            remaining = max(0, self._remaining.get(path, 1) - 1)
+            self._remaining[path] = remaining
+        if remaining == 0:
+            self._release_source(path)
 
     def _release_source(self, path):
         with self._state_lock:
@@ -372,12 +443,20 @@ class Pipeline:
             self.fatal.set()
             self.stop.set()
 
+    def _job_tasks(self, job):
+        if job.outputs:
+            return job.outputs
+        return (OutputTask(None, job.out, job.plan, self.opts.quality,
+                           self.opts.subsampling, ""),)
+
     @contextmanager
     def _working(self, job):
         px = job.meta.width * job.meta.height
         # Conservative application-owned CPU arrays. Native codec workspaces
         # remain implementation-dependent, so this is not an OS RSS limit.
-        size = px * (64 if job.has_alpha else 10) + job.plan.out_w * job.plan.out_h * 16
+        out_px = sum(task.plan.out_w * task.plan.out_h
+                     for task in self._job_tasks(job))
+        size = px * (64 if job.has_alpha else 10) + out_px * 16
         if not self._working_budget.acquire(size, self.stop):
             raise RuntimeError("processing cancelled")
         try:
@@ -434,7 +513,6 @@ class Pipeline:
                         src = None
                 if src is None:
                     break
-                out = self._out_map[src]
                 t0 = time.perf_counter()
                 try:
                     size = src.stat().st_size
@@ -453,24 +531,66 @@ class Pipeline:
                         if is_truncated_jpeg(data):
                             raise ValueError("truncated JPEG (missing EOI marker)")
                     meta = read_source_meta(data)
-                    box_w, box_h = compute_box(
-                        meta.display_width, meta.display_height,
-                        self.opts.sizing, self.opts.max_w, self.opts.max_h,
-                        self.opts.sizing_value)
-                    plan = make_plan(meta.display_width, meta.display_height,
-                                     box_w, box_h,
-                                     self.opts.mode, self.opts.allow_upscale)
-                    job = Job(src, out, data, meta, plan,
-                              meta.has_alpha, hashlib.sha256(data).hexdigest())
-                    if out.exists() and not self.opts.overwrite:
-                        if self.opts.skip_existing and self._resume.valid(job, self.opts.input_dir):
-                            with self._state_lock:
-                                self._terminal.add(src)
-                            with self.stats.lock:
-                                self.stats.skipped += 1
-                            self._release_source(src)
-                            continue
-                        raise FileExistsError("existing output is unverified or configuration changed; use --overwrite")
+                    digest = hashlib.sha256(data).hexdigest()
+                    targets = self._targets_by_source[src]
+                    tasks: list[OutputTask] = []
+                    if self.opts.variants:
+                        for variant in self.opts.variants:
+                            if variant.subsampling == "auto":
+                                subsampling = auto_subsampling(variant.quality)
+                            elif isinstance(variant.subsampling, int) and variant.subsampling in (0, 1, 2):
+                                subsampling = variant.subsampling
+                            else:
+                                subsampling = SUBSAMPLING_NAMES.get(str(variant.subsampling), 2)
+                            box_w, box_h = compute_box(
+                                meta.display_width, meta.display_height,
+                                variant.sizing, variant.max_w, variant.max_h,
+                                variant.sizing_value)
+                            plan = make_plan(meta.display_width, meta.display_height,
+                                             box_w, box_h, variant.mode,
+                                             variant.allow_upscale)
+                            tasks.append(OutputTask(
+                                variant.id, targets[variant.id], plan,
+                                variant.quality, subsampling,
+                                self._variant_digests[variant.id]))
+                    else:
+                        box_w, box_h = compute_box(
+                            meta.display_width, meta.display_height,
+                            self.opts.sizing, self.opts.max_w, self.opts.max_h,
+                            self.opts.sizing_value)
+                        plan = make_plan(meta.display_width, meta.display_height,
+                                         box_w, box_h,
+                                         self.opts.mode, self.opts.allow_upscale)
+                        tasks.append(OutputTask(
+                            None, targets[None], plan, self.opts.quality,
+                            self.opts.subsampling, self._resume.fingerprint))
+                    job = Job(src, tasks[0].out, data, meta, tasks[0].plan,
+                              meta.has_alpha, digest, tuple(tasks))
+                    if not self.opts.overwrite:
+                        remaining_tasks = []
+                        for task in tasks:
+                            if not task.out.exists():
+                                remaining_tasks.append(task)
+                                continue
+                            if (self.opts.skip_existing and
+                                    self._resume.valid(
+                                        job, self.opts.input_dir,
+                                        variant_id=task.variant_id,
+                                        config_digest=task.config_digest,
+                                        out=task.out, plan=task.plan)):
+                                self._mark_skipped(job, task)
+                                continue
+                            self._fail_output(job, task, FileExistsError(
+                                "existing output is unverified or configuration "
+                                "changed; use --overwrite"))
+                            self._complete_output(src)
+                        tasks = remaining_tasks
+                    if not tasks:
+                        self._release_source(src)
+                        continue
+                    job.outputs = tuple(tasks)
+                    job.out = tasks[0].out
+                    job.plan = tasks[0].plan
                 except Exception as exc:
                     self._fail(src, exc)
                     continue
@@ -528,10 +648,17 @@ class Pipeline:
     @staticmethod
     def _gpu_estimate(job):
         # Sum is conservative for application-owned arrays, not decoder/pool RSS.
-        p = job.plan
+        outputs = job.outputs or (OutputTask(None, job.out, job.plan, 0, 0, ""),)
+        resize = sum(12 * task.plan.src_h * task.plan.out_w for task in outputs)
+        encoded = sum(3 * task.plan.out_w * task.plan.out_h for task in outputs)
         return (job.meta.width * job.meta.height * (8 if job.has_alpha else 4) +
-                12 * p.src_h * p.out_w + 3 * p.out_w * p.out_h +
+                resize + encoded +
                 64 * 2**20)  # bounded table cache + codec headroom per item
+
+    def _task_digest(self, res):
+        if res.variant_id is None:
+            return self._resume.fingerprint
+        return self._variant_digests[res.variant_id]
 
     def _writer(self):
         while True:
@@ -542,26 +669,42 @@ class Pipeline:
                     return
                 continue
             t0 = time.perf_counter()
+            task = OutputTask(res.variant_id, res.out, res.plan, 0, 0, "")
             try:
                 if self.fatal.is_set():
-                    self._fail(res.job.src, RuntimeError("worker failure before publication"))
+                    self._fail_output(res.job, task, RuntimeError(
+                        "worker failure before publication"))
                     continue
-                protect_target(res.job.out, self.opts.output_dir, self._sources, self._identities)
-                atomic_write(res.job.out, res.jpeg, self.opts.fsync, overwrite=self.opts.overwrite)
+                protect_target(res.out, self.opts.output_dir,
+                               self._sources, self._identities)
+                atomic_write(res.out, res.jpeg, self.opts.fsync,
+                             overwrite=self.opts.overwrite)
                 with self._state_lock:
-                    self._resume.record(res.job, res.jpeg, self.opts.input_dir)
-                    self._terminal.add(res.job.src)
+                    self._resume.record(
+                        res.job, res.jpeg, self.opts.input_dir,
+                        variant_id=res.variant_id,
+                        config_digest=self._task_digest(res),
+                        out=res.out, plan=res.plan)
+                    self._terminal.add((res.job.src, res.variant_id))
                 self.stats.add(res, time.perf_counter() - t0)
             except Exception as exc:
-                self._fail(res.job.src, exc)
+                self._fail_output(res.job, task, exc)
             finally:
-                self._release_source(res.job.src)
+                self._complete_output(res.job.src)
 
     # -- processing ----------------------------------------------------------
-    def _finish(self, job: Job, jpeg: bytes, timings: dict,
-                backend: str) -> None:
+    def _finish(self, job: Job, second, third=None, fourth=None,
+                fifth="cpu") -> None:
+        if isinstance(second, OutputTask):
+            task, jpeg, timings, backend = second, third, fourth or {}, fifth
+        else:
+            # Legacy private signature: _finish(job, jpeg, timings, backend).
+            task = OutputTask(None, job.out, job.plan, self.opts.quality,
+                              self.opts.subsampling, "")
+            jpeg, timings, backend = second, third or {}, fourth or "cpu"
+        key = (job.src, task.variant_id)
         with self._state_lock:
-            if job.src in self._terminal or job.src in self._pending:
+            if key in self._terminal or key in self._pending:
                 return
         t0 = time.perf_counter()
         icc = job.meta.icc
@@ -572,15 +715,18 @@ class Pipeline:
             # Fail this file visibly rather than attach stale EXIF/ICC or drop it silently.
             jpeg = splice_metadata(jpeg, job.meta.exif if self.opts.keep_exif else None,
                     icc if self.opts.keep_icc else None,
-                    dimensions=(job.plan.out_w, job.plan.out_h))
+                    dimensions=(task.plan.out_w, task.plan.out_h))
         timings["metadata"] = time.perf_counter() - t0
         with self._state_lock:
-            if job.src in self._terminal or job.src in self._pending:
+            if key in self._terminal or key in self._pending:
                 return
-            self._pending.add(job.src)
-        res = Result(job, jpeg, job.plan.out_w, job.plan.out_h, backend, timings)
+            self._pending.add(key)
+        res = Result(job, jpeg, task.out, task.plan.out_w, task.plan.out_h,
+                     backend, timings, task.variant_id, task.plan)
         if not self._put_result(res):
-            self._fail(job.src, RuntimeError("worker failure prevented publication"))
+            self._fail_output(job, task, RuntimeError(
+                "worker failure prevented publication"))
+            self._complete_output(job.src)
 
     def _process_cpu_one(self, job: Job, engine=None, backend="cpu") -> None:
         engine = engine or self.engine
@@ -598,19 +744,32 @@ class Pipeline:
                 img = engine.composite_bg(img, self.opts.bg_color)
             img = engine.apply_orientation(img, job.meta.orientation)
             t2 = time.perf_counter()
-            small = engine.resize(img, job.plan)
-            t3 = time.perf_counter()
-            jpeg = engine.encode(small, self.opts.quality, self.opts.subsampling)
-            t4 = time.perf_counter()
-            timings = {"decode": t1 - t0, "normalize": t2 - t1, "resize": t3 - t2,
-                       "encode": t4 - t3}
-            self._finish(job, jpeg, timings, backend)
+            tasks = self._job_tasks(job)
+            count = max(1, len(tasks))
+            for task in tasks:
+                try:
+                    t3 = time.perf_counter()
+                    small = engine.resize(img, task.plan)
+                    t4 = time.perf_counter()
+                    jpeg = engine.encode(small, task.quality, task.subsampling)
+                    t5 = time.perf_counter()
+                    timings = {"decode": (t1 - t0) / count,
+                               "normalize": (t2 - t1) / count,
+                               "resize": t4 - t3, "encode": t5 - t4}
+                    self._finish(job, task, jpeg, timings, backend)
+                except Exception as exc:
+                    self._fail_output(job, task, exc)
+                    self._complete_output(job.src)
         except Exception as exc:
             self._fail(job.src, exc)
 
     def _process_gpu_batch(self, batch):
         with self._state_lock:
-            batch = [j for j in batch if j.src not in self._terminal and j.src not in self._pending]
+            batch = [
+                j for j in batch
+                if any((j.src, task.variant_id) not in self._terminal
+                       for task in self._job_tasks(j))
+            ]
         if not batch:
             return
         error = None
@@ -653,13 +812,25 @@ class Pipeline:
                     raise ValueError("decoder dropped source alpha")
                 self._sync_profile()
                 t2 = time.perf_counter()
-                small = self.engine.resize(arr, job.plan)
-                self._sync_profile()
-                t3 = time.perf_counter()
-                jpeg = self.engine.encode(small, self.opts.quality, self.opts.subsampling)
-                self._sync_profile()
-                self._finish(job, jpeg, {"decode": decode_time, "normalize": t2-t1,
-                    "resize": t3-t2, "encode": time.perf_counter()-t3}, "nvimgcodec-auto")
+                tasks = self._job_tasks(job)
+                count = max(1, len(tasks))
+                for task in tasks:
+                    try:
+                        small = self.engine.resize(arr, task.plan)
+                        self._sync_profile()
+                        t3 = time.perf_counter()
+                        jpeg = self.engine.encode(small, task.quality,
+                                                  task.subsampling)
+                        self._sync_profile()
+                        self._finish(job, task, jpeg, {
+                            "decode": decode_time / count,
+                            "normalize": (t2 - t1) / count,
+                            "resize": t3 - t2,
+                            "encode": time.perf_counter() - t3,
+                        }, "nvimgcodec-auto")
+                    except Exception as exc:
+                        self._gpu_fallback(job, exc)
+                        break
             except Exception as exc:
                 self._gpu_fallback(job, exc)
 
@@ -691,17 +862,20 @@ class Pipeline:
             if int(arr.shape[2]) == 4:
                 arr = engine.alpha_to_rgb(arr, self.opts.bg_color)
             self._sync_profile()
-            small = engine.resize(arr, job.plan)
-            self._sync_profile()
-            t3 = time.perf_counter()
-            jpeg = engine.encode(small, self.opts.quality,
-                                 self.opts.subsampling)
-            self._sync_profile()
-            t4 = time.perf_counter()
-            timings = {"decode": t1 - t0, "normalize": t2 - t1, "resize": t3 - t2,
-                       "encode": t4 - t3}
-            self._sync_profile()
-            self._finish(job, jpeg, timings, "hybrid")
+            tasks = self._job_tasks(job)
+            count = max(1, len(tasks))
+            for task in tasks:
+                small = engine.resize(arr, task.plan)
+                self._sync_profile()
+                t3 = time.perf_counter()
+                jpeg = engine.encode(small, task.quality, task.subsampling)
+                self._sync_profile()
+                t4 = time.perf_counter()
+                timings = {"decode": (t1 - t0) / count,
+                           "normalize": (t2 - t1) / count,
+                           "resize": t3 - t2, "encode": t4 - t3}
+                self._sync_profile()
+                self._finish(job, task, jpeg, timings, "hybrid")
         except Exception:
             raise
 
@@ -710,7 +884,12 @@ class Pipeline:
             self._fail(job.src, exc)
             return
         with self._state_lock:
-            if job.src in self._terminal or job.src in self._pending:
+            unresolved = [
+                task for task in self._job_tasks(job)
+                if (job.src, task.variant_id) not in self._terminal
+                and (job.src, task.variant_id) not in self._pending
+            ]
+            if not unresolved:
                 return
             if len(self._warnings) < 50:
                 self._warnings.append(f"{job.src}: GPU rejected file; full CPU fallback: {exc}")
@@ -734,7 +913,7 @@ class Pipeline:
         elapsed = max(1e-9, now - t_start)
         rate = snap["processed"] / elapsed
         done = snap["processed"] + snap["failed"] + snap["skipped"]
-        total = self.discovered
+        total = self._outputs_total or self.discovered
         if self.on_progress is not None:
             try:
                 self.on_progress({
@@ -745,12 +924,14 @@ class Pipeline:
                     "skipped": snap["skipped"],
                     "elapsed": elapsed,
                     "rate": rate,
+                    "sources_total": self.discovered,
+                    "outputs_total": self._outputs_total,
                     "final": final,
                 })
             except Exception:
                 pass
             return
-        line = (f"\r{done}/{total} files | {rate:.1f} file/s | "
+        line = (f"\r{done}/{total} outputs | {rate:.1f} output/s | "
                 f"{elapsed:.1f}s | threads: "
                 f"readers={self._n_readers} "
                 f"processors={self._n_processors} "
@@ -837,8 +1018,15 @@ class Pipeline:
             except PackageNotFoundError:
                 versions[package] = None
         config.update(backend=self.backend, resume_contract=2, application=__version__,
-                      libraries=versions, input_root=str(opts.input_dir))
+                      libraries=versions, input_root=str(opts.input_dir),
+                      variants=[variant.to_profile_dict() for variant in opts.variants])
         self._resume = ResumeState(opts.output_dir, config)
+        self._variant_digests = {}
+        for variant in opts.variants:
+            active = dict(config)
+            active["active_variant"] = variant.to_profile_dict()
+            self._variant_digests[variant.id] = hashlib.sha256(
+                json.dumps(active, sort_keys=True).encode()).hexdigest()
         try:
             self._resume.acquire()
             return self._run_locked()
@@ -866,10 +1054,37 @@ class Pipeline:
         self.discovered = len(files)
         self._sources = {path_key(p) for p in all_files}
         self._identities = source_identities(all_files)
-        previous = self._resume.previous_mapping(all_files, opts.input_dir)
-        self._out_map = build_output_map(files, opts.input_dir, opts.output_dir, previous)
-        for target in self._out_map.values():
-            protect_target(target, opts.output_dir, self._sources, self._identities)
+        self._variant_maps = {}
+        self._targets_by_source = {}
+        if opts.variants:
+            for variant in opts.variants:
+                previous = self._resume.previous_mapping(
+                    all_files, opts.input_dir, variant.id)
+                self._variant_maps[variant.id] = build_output_map(
+                    files, opts.input_dir, opts.output_dir / variant.id, previous)
+            self._out_map = self._variant_maps[opts.variants[0].id]
+            for src in files:
+                self._targets_by_source[src] = {
+                    variant.id: self._variant_maps[variant.id][src]
+                    for variant in opts.variants
+                }
+        else:
+            previous = self._resume.previous_mapping(all_files, opts.input_dir)
+            self._out_map = build_output_map(
+                files, opts.input_dir, opts.output_dir, previous)
+            for src in files:
+                self._targets_by_source[src] = {None: self._out_map[src]}
+        for mapping in self._targets_by_source.values():
+            for target in mapping.values():
+                protect_target(target, opts.output_dir,
+                               self._sources, self._identities)
+        variant_ids = tuple(variant.id for variant in opts.variants) or (None,)
+        self._expected = {
+            (src, variant_id)
+            for src in files for variant_id in variant_ids
+        }
+        self._remaining = {src: len(variant_ids) for src in files}
+        self._outputs_total = len(self._expected)
         self._file_iter = iter(files)
         interrupted = False
 
@@ -904,8 +1119,12 @@ class Pipeline:
                 self._join_writers(self._writers)
 
         for src in files:
-            if src not in self._terminal:
-                self._fail(src, RuntimeError("cancelled" if interrupted else "worker did not complete job"))
+            with self._state_lock:
+                done = all(key in self._terminal for key in self._expected
+                           if key[0] == src)
+            if not done:
+                self._fail(src, RuntimeError(
+                    "cancelled" if interrupted else "worker did not complete job"))
         if any(t.is_alive() for t in self._readers + self._processors + self._writers):
             self._fatal_errors.append("live native worker: manifest not saved; output lock retained")
             self.fatal.set()
@@ -920,6 +1139,12 @@ class Pipeline:
     def _report(self, interrupted: bool) -> dict:
         elapsed = max(1e-9, time.perf_counter() - self.t_start)
         snap = self.stats.snapshot()
+        with self._state_lock:
+            sources_complete = sum(
+                1 for src in {key[0] for key in self._expected}
+                if all(key in self._terminal for key in self._expected
+                       if key[0] == src)
+            )
         processed = snap["processed"]
         per = (lambda v: round(1000.0 * v / processed, 3)) if processed else (lambda v: 0.0)
         return {
@@ -941,6 +1166,10 @@ class Pipeline:
             "backend": self.backend,
             "engine": self.backend,
             "discovered": self.discovered,
+            "sources_total": self.discovered,
+            "sources_complete": sources_complete,
+            "outputs_total": self._outputs_total,
+            "variants": [variant.to_profile_dict() for variant in self.opts.variants],
             "processed": processed,
             "failed": snap["failed"],
             "skipped": snap["skipped"],
@@ -949,6 +1178,7 @@ class Pipeline:
             "bytes_out": snap["bytes_out"],
             "elapsed_sec": round(elapsed, 3),
             "files_per_sec": round(processed / elapsed, 2),
+            "outputs_per_sec": round(processed / elapsed, 2),
             "mb_per_sec_in": round(snap["bytes_in"] / 2 ** 20 / elapsed, 2),
             "threads": {
                 "readers": self._n_readers,

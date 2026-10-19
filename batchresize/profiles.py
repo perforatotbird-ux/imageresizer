@@ -17,6 +17,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
+from .variants import OutputVariant, VariantError
+
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -171,11 +173,13 @@ def _validate_variants(value) -> tuple[dict, ...]:
         if variant_id in seen:
             _fail(f"{path}.id", "duplicate variant id")
         seen.add(variant_id)
-        entry = {"id": variant_id,
-                 "name": _text(data.get("name", variant_id), f"{path}.name", maximum=80),
-                 "size": _validate_size(data.get("size")),
-                 "fit": _validate_fit(data.get("fit", {"mode": "contain"})),
-                 "jpeg": _validate_jpeg(data.get("jpeg", {"quality": 80}))}
+        try:
+            output = OutputVariant.from_profile_dict(data)
+        except VariantError as exc:
+            raise ProfileError(f"{path}: {exc}") from exc
+        entry = output.to_profile_dict()
+        entry["name"] = _text(data.get("name", entry["name"]),
+                              f"{path}.name", maximum=80)
         result.append(entry)
     return tuple(result)
 

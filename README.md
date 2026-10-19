@@ -63,9 +63,17 @@ run.bat --size custom --width 800 --height 600 --jpeg-quality 88 --filter lanczo
 run.bat --sizing percent --sizing-value 50 --backend cpu
 run.bat --sizing megapixels --sizing-value 2 --backend auto
 run.bat --sizing longest --sizing-value 1600
+run.bat -i "D:\Photos" -o "D:\Out" --variant thumb:128x128:cover:80:420 --variant web:1024:contain:85
 run.bat --gui
 run.bat --help
 ```
+
+### Несколько размеров за один запуск (`--variant`)
+
+Флаг `--variant ID:SIZE[:MODE[:QUALITY[:SUBSAMPLING]]]` можно указывать несколько раз.
+При наличии вариантов результаты записываются в подкаталоги `<output>/<variant_id>/<относительный_путь>.jpg`.
+Оригинал декодируется один раз на CPU/GPU и переиспользуется для всех вариантов без накопления потерь сжатия.
+В текущей версии генерация нескольких вариантов поддерживается через CLI и профили задач; визуальный редактор вариантов в Desktop UI запланирован на следующий этап.
 
 Размеры: `thumb_256`, `small_512`, `web_1024`, `large_1600` (квадратная граница),
 либо `custom` с шириной и высотой. Дополнительные режимы: `percent`, `megapixels`,

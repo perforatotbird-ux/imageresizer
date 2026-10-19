@@ -73,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
                                help="apply a single profile from a JSON file")
     p.add_argument("--list-profiles", action="store_true",
                    help="list built-in and saved profiles and exit")
+    p.add_argument("--variant", action="append", default=None, metavar="SPEC",
+                   help="additional output: ID:WxH[:MODE[:QUALITY[:SUBSAMPLING]]] "
+                        "or ID:SIZING:VALUE[:MODE[:QUALITY[:SUBSAMPLING]]] "
+                        "(repeatable; overrides profile variants)")
 
     p.add_argument("--size", default="web_1024",
                    choices=[*SIZE_PRESETS, "custom"],
@@ -224,10 +228,17 @@ def _load_cli_profile(args) -> Profile | None:
 def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
                   provided: set[str] | None = None):
     from .pipeline import RunOptions
+    from .variants import OutputVariant, VariantError, parse_variant_spec
     provided = provided or set()
-    if profile is not None and profile.variants:
-        raise SystemExit("error: profiles with output variants require the "
-                         "multi-variant stage and are not supported yet")
+    variants: list[OutputVariant] = []
+    try:
+        if args.variant:
+            variants = [parse_variant_spec(spec) for spec in args.variant]
+        elif profile is not None:
+            variants = [OutputVariant.from_profile_dict(item)
+                        for item in profile.variants]
+    except VariantError as exc:
+        raise SystemExit(f"error: {exc}")
 
     size_explicit = bool({"size", "width", "height", "sizing",
                           "sizing_value"} & provided)
@@ -319,6 +330,7 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         fsync=args.fsync,
         profile_cuda=args.profile_cuda,
         cancel_file=Path(os.environ["BATCHRESIZE_CANCEL_FILE"]) if os.environ.get("BATCHRESIZE_CANCEL_FILE") else None,
+        variants=tuple(variants),
     )
 
 
@@ -358,7 +370,13 @@ def _print_summary(rep: dict) -> None:
     print(f"Output       : {rep['output']}")
     print(f"Backend      : {rep['backend']}")
     print(f"Discovered   : {rep['discovered']} file(s)")
-    print(f"Processed    : {rep['processed']}")
+    variants = rep.get("variants") or []
+    if variants:
+        ids = ", ".join(item["id"] for item in variants)
+        print(f"Variants     : {len(variants)} ({ids})")
+    print(f"Outputs      : {rep.get('outputs_total', rep['discovered'])} "
+          f"({rep.get('sources_complete', rep['processed'])} source(s) complete)")
+    print(f"Processed    : {rep['processed']} output(s)")
     print(f"Failed       : {rep['failed']}")
     print(f"Skipped      : {rep['skipped']}")
     if rep["fallback_files"]:
@@ -442,8 +460,10 @@ def _benchmark(opts, repeats: int, quiet: bool) -> int:
             before_unchanged = manifest() == initial_manifest
             rep = _run_once(o, engine, kind, quiet, files=files)
             rep["benchmark_input_unchanged"] = before_unchanged and manifest() == initial_manifest
-            rep["benchmark_valid"] = (rep["complete"] and rep["processed"] == len(files)
-                                      and rep["benchmark_input_unchanged"])
+            rep["benchmark_valid"] = (
+                rep["complete"] and
+                rep["processed"] == rep.get("outputs_total", len(files)) and
+                rep["benchmark_input_unchanged"])
             runs.append(rep)
             if rep["benchmark_valid"] and (best is None or rep["elapsed_sec"] < best["elapsed_sec"]):
                 best = rep
@@ -592,7 +612,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
     print(f"engine       : {kind}")
     if profile is not None:
         print(f"profile      : {profile.name} ({profile.id})")
-    print(f"output       : {spec.describe()}")
+    if opts.variants:
+        for variant in opts.variants:
+            print(f"output       : {variant.describe()}")
+    else:
+        print(f"output       : {spec.describe()}")
     print(f"input        : {src}")
     print(f"output dir   : {dst}")
     print(f"threads      : readers={opts.workers}, "

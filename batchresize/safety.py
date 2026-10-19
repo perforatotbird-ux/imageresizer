@@ -111,14 +111,21 @@ class ResumeState:
             self.lock_path.unlink(missing_ok=True)
             self.locked = False
 
-    def previous_mapping(self, files, src):
+    @staticmethod
+    def _key(relative: str, variant_id):
+        return relative if variant_id is None else f'{relative}::{variant_id}'
+
+    def previous_mapping(self, files, src, variant_id=None):
         out = {}
-        for rel, entry in self.entries.items():
+        for key, entry in self.entries.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                raise ValueError('invalid resume entry')
+            if entry.get('variant') != variant_id:
+                continue
+            rel = entry.get('source', key)
             if not isinstance(rel, str) or Path(rel).is_absolute() or '..' in Path(rel).parts:
                 raise ValueError('invalid manifest source path')
             f = src / rel
-            if not isinstance(entry, dict):
-                raise ValueError('invalid resume entry')
             name = entry.get('output')
             if name:
                 target = self.root / name
@@ -130,29 +137,47 @@ class ResumeState:
                 out[f] = target
         return out
 
-    def valid(self, job, src):
-        entry = self.entries.get(job.src.relative_to(src).as_posix(), {})
-        if (entry.get('config') != self.fingerprint or
-            entry.get('source_sha256') != job.digest or
-            entry.get('output') != job.out.relative_to(self.root).as_posix()):
+    def valid(self, job, src, *, variant_id=None, config_digest=None,
+              out=None, plan=None):
+        relative = job.src.relative_to(src).as_posix()
+        entry = self.entries.get(self._key(relative, variant_id), {})
+        out = out or job.out
+        plan = plan or job.plan
+        if (entry.get('variant') != variant_id or
+                entry.get('source', relative) != relative or
+                entry.get('config') != (config_digest or self.fingerprint) or
+                entry.get('source_sha256') != job.digest or
+                entry.get('output') != out.relative_to(self.root).as_posix()):
             return False
         try:
-            data = job.out.read_bytes()
+            data = out.read_bytes()
             if hashlib.sha256(data).hexdigest() != entry.get('output_sha256'):
                 return False
             import io
             with Image.open(io.BytesIO(data)) as im:
                 im.load()
                 return (im.format == 'JPEG' and im.mode == 'RGB' and
-                        im.size == (job.plan.out_w, job.plan.out_h))
+                        im.size == (plan.out_w, plan.out_h))
         except (OSError, ValueError):
             return False
 
-    def record(self, job, jpeg, src):
-        self.entries[job.src.relative_to(src).as_posix()] = {
-            'config': self.fingerprint, 'source_sha256': job.digest,
-            'output': job.out.relative_to(self.root).as_posix(),
-            'output_sha256': hashlib.sha256(jpeg).hexdigest()}
+    def record(self, job, jpeg, src, *, variant_id=None, config_digest=None,
+               out=None, plan=None):
+        relative = job.src.relative_to(src).as_posix()
+        out = out or job.out
+        plan = plan or job.plan
+        entry = {
+            'config': config_digest or self.fingerprint,
+            'source_sha256': job.digest,
+            'source': relative,
+            'output': out.relative_to(self.root).as_posix(),
+            'output_sha256': hashlib.sha256(jpeg).hexdigest(),
+            'output_w': plan.out_w,
+            'output_h': plan.out_h,
+        }
+        if variant_id is not None:
+            entry['variant'] = variant_id
+        self.entries[self._key(relative, variant_id)] = entry
 
     def save(self):
         payload = json.dumps({'version': 1, 'entries': self.entries}, ensure_ascii=False, indent=2)
