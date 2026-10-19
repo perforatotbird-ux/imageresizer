@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -310,18 +311,84 @@ def _benchmark(opts: RunOptions, repeats: int, quiet: bool) -> int:
     return 0
 
 
+def _tkinter_available() -> bool:
+    try:
+        import tkinter  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _alternative_pythons() -> list[str]:
+    """Other interpreters on this machine that may ship with tkinter."""
+    import shutil
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        try:
+            key = str(Path(path).resolve()).lower()
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(path)
+
+    me = str(Path(sys.executable).resolve()).lower()
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path and str(Path(path).resolve()).lower() != me:
+            add(path)
+    if sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python"
+        if local.is_dir():
+            for child in sorted(local.iterdir(), reverse=True):
+                exe = child / "python.exe"
+                if exe.exists() and str(exe.resolve()).lower() != me:
+                    add(str(exe))
+    return found
+
+
+def _launch_gui_elsewhere() -> int:
+    """Re-launch the UI with an interpreter that has tkinter."""
+    import os
+    import subprocess
+
+    project = str(PROJECT_DIR)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = project + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+    for exe in _alternative_pythons():
+        try:
+            probe = subprocess.run(
+                [exe, "-c", "import tkinter"], cwd=project, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode != 0:
+            continue
+        print(f"UI: using {exe} (this Python has no tkinter)")
+        return subprocess.call([exe, "-m", "batchresize", "--gui"],
+                               cwd=project, env=env)
+
+    print("error: the desktop UI needs tkinter, but no interpreter with "
+          "tkinter was found.", file=sys.stderr)
+    print("Install Python from python.org (it includes tkinter) or use the "
+          "command line.", file=sys.stderr)
+    return 2
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.gui:
-        try:
-            from .gui import main as gui_main
-        except ImportError as exc:
-            raise SystemExit(
-                f"error: the GUI needs tkinter, which is missing from this "
-                f"Python ({exc}).\nUse a standard python.org build or run "
-                f"the CLI instead."
-            )
+        if not _tkinter_available():
+            return _launch_gui_elsewhere()
+        from .gui import main as gui_main
 
         return gui_main()
 
