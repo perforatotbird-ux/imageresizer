@@ -284,6 +284,11 @@ class _ByteBudget:
 _EMPTY = object()
 _EOF = object()
 
+# Readers/processors must react to stop promptly; writers may legitimately need
+# to drain results that were already queued when processing finished.
+JOIN_TIMEOUT = 5.0
+WRITER_STALL_TIMEOUT = 30.0
+
 
 class Pipeline:
     """Threaded stages connected by bounded queues.
@@ -321,6 +326,7 @@ class Pipeline:
         self.t_start = 0.0
         self._progress_enabled = progress
         self._last_progress = 0.0
+        self._writer_stall_timeout = WRITER_STALL_TIMEOUT
 
         if backend == "cpu":
             self._n_readers = max(1, opts.workers)
@@ -766,11 +772,12 @@ class Pipeline:
                     break
             time.sleep(.02)
         self._send_writer_sentinels()
-        self._join_bounded(threads)
+        self._join_bounded(self._readers + self._processors)
+        self._join_writers(self._writers)
         self._progress(t_start, final=True)
 
     def _join_bounded(self, threads):
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + JOIN_TIMEOUT
         for t in threads:
             t.join(timeout=max(0, deadline - time.monotonic()))
         alive = [t.name for t in threads if t.is_alive()]
@@ -778,11 +785,39 @@ class Pipeline:
             self.fatal.set(); self.stop.set()
             self._fatal_errors.append("native operation did not stop: " + ", ".join(alive))
 
+    def _join_writers(self, writers):
+        """Wait for writers to drain instead of treating a full queue as a hang.
+
+        The queue can still hold results when processing ends, so a fixed join
+        timeout is not a valid liveness test. A writer is considered stuck only
+        when no file completes for ``_writer_stall_timeout`` seconds.
+        """
+        if not writers:
+            return
+        last_done = self._completed_count()
+        last_change = time.monotonic()
+        while any(t.is_alive() for t in writers):
+            now = time.monotonic()
+            done = self._completed_count()
+            if done != last_done:
+                last_done = done
+                last_change = now
+            elif now - last_change >= self._writer_stall_timeout:
+                alive = [t.name for t in writers if t.is_alive()]
+                self.fatal.set(); self.stop.set()
+                self._fatal_errors.append("native operation did not stop: " + ", ".join(alive))
+                return
+            time.sleep(.02)
+
+    def _completed_count(self):
+        snap = self.stats.snapshot()
+        return snap["processed"] + snap["failed"] + snap["skipped"]
+
     def _shutdown(self):
         self.stop.set()
         self._join_bounded(self._readers + self._processors)
         self._send_writer_sentinels()
-        self._join_bounded(self._writers)
+        self._join_writers(self._writers)
 
     def run(self) -> dict:
         opts = self.opts
@@ -865,7 +900,8 @@ class Pipeline:
                 self._shutdown()
             finally:
                 self._send_writer_sentinels()
-                self._join_bounded(threads)
+                self._join_bounded(self._readers + self._processors)
+                self._join_writers(self._writers)
 
         for src in files:
             if src not in self._terminal:

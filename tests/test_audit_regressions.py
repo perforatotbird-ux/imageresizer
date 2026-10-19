@@ -80,6 +80,31 @@ def test_IR04_writer_failure_does_not_deadlock(tmp_path):
     r=p.run();assert not r['complete'] and r['processed']+r['failed']==r['discovered']
     assert all(not t.is_alive() for t in p._readers+p._processors+p._writers)
 
+def test_writer_drain_is_not_misreported_as_fatal(tmp_path):
+    import threading, time
+    s=source(tmp_path)
+    p=Pipeline(RunOptions(s,tmp_path/'out',32,32,workers=1),CpuEngine(),'cpu',False)
+    def slow_writer():
+        for _ in range(10):
+            time.sleep(0.05)
+            with p.stats.lock:p.stats.processed+=1
+    t=threading.Thread(target=slow_writer,name='writer-0');t.start()
+    p._writers=[t]
+    p._join_writers(p._writers);t.join()
+    assert not p.fatal.is_set() and not p._fatal_errors
+
+def test_stuck_writer_is_reported_as_fatal(tmp_path):
+    import threading, time
+    s=source(tmp_path)
+    p=Pipeline(RunOptions(s,tmp_path/'out',32,32,workers=1),CpuEngine(),'cpu',False)
+    p._writer_stall_timeout=0.1
+    t=threading.Thread(target=time.sleep,args=(0.5,),name='writer-0');t.start()
+    p._writers=[t]
+    started=time.monotonic();p._join_writers(p._writers);elapsed=time.monotonic()-started
+    t.join()
+    assert p.fatal.is_set() and any('writer-0' in e for e in p._fatal_errors)
+    assert elapsed < 0.45
+
 @pytest.mark.parametrize('value', [float('nan'),float('inf'),0,-1])
 def test_IR04_IR10_budget_validated(tmp_path,value):
     with pytest.raises(ValueError):RunOptions(tmp_path,tmp_path/'o',32,32,vram_budget_gb=value)
