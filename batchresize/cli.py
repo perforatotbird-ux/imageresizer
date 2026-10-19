@@ -25,6 +25,9 @@ def doctor_report():
 
 from .presets import (ALL_QUALITY_PRESETS, SIZE_PRESETS, OutputSpec,
                       resolve_quality, resolve_size)
+from .profiles import (Profile, builtin_profiles,
+                       default_profiles_path, find_profile, load_profiles,
+                       read_profile_file)
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = PROJECT_DIR / "input"
@@ -62,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="source folder (fixed to ./input, override only if needed)")
     p.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT),
                    help="destination folder (fixed to ./output)")
+
+    profile_group = p.add_mutually_exclusive_group()
+    profile_group.add_argument("--profile", default=None, metavar="NAME_OR_ID",
+                               help="apply a saved or built-in task profile")
+    profile_group.add_argument("--profile-file", default=None, metavar="PATH",
+                               help="apply a single profile from a JSON file")
+    p.add_argument("--list-profiles", action="store_true",
+                   help="list built-in and saved profiles and exit")
 
     p.add_argument("--size", default="web_1024",
                    choices=[*SIZE_PRESETS, "custom"],
@@ -152,22 +163,121 @@ def _resolve_paths(args) -> tuple[Path, Path]:
     return src, dst
 
 
-def _make_options(args, src: Path, dst: Path):
+def _provided_dests(argv: list[str], parser: argparse.ArgumentParser) -> set[str]:
+    """Which options the user actually typed, for profile precedence."""
+    provided: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("-") or token == "-":
+            continue
+        key = token.split("=", 1)[0]
+        action = parser._option_string_actions.get(key)
+        if action is not None:
+            provided.add(action.dest)
+    return provided
+
+
+def _merged_profiles() -> tuple[list[Profile], list[str]]:
+    user, errors = load_profiles(default_profiles_path())
+    combined = builtin_profiles()
+    seen = {profile.id for profile in combined}
+    for profile in user:
+        if profile.id in seen:
+            errors.append(f"profile {profile.id!r} collides with a built-in profile")
+            continue
+        combined.append(profile)
+        seen.add(profile.id)
+    return combined, errors
+
+
+def _list_profiles() -> int:
+    profiles, errors = _merged_profiles()
+    print(f"Profiles: {default_profiles_path()}")
+    for profile in profiles:
+        kind = "built-in" if profile.builtin else "user"
+        print(f"  {profile.id:32} {profile.name}  [{kind}]")
+    for error in errors:
+        print(f"warning: {error}", file=sys.stderr)
+    return 0
+
+
+def _load_cli_profile(args) -> Profile | None:
+    if args.profile_file:
+        path = Path(args.profile_file).expanduser()
+        profiles = read_profile_file(path)
+        if len(profiles) != 1:
+            raise SystemExit("error: --profile-file must contain exactly one "
+                             f"profile (found {len(profiles)})")
+        return profiles[0]
+    if args.profile:
+        profiles, _ = _merged_profiles()
+        profile = find_profile(profiles, args.profile)
+        if profile is None:
+            names = ", ".join(profile.name for profile in profiles)
+            raise SystemExit(f"error: profile not found: {args.profile}. "
+                             f"Available: {names}")
+        return profile
+    return None
+
+
+def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
+                  provided: set[str] | None = None):
     from .pipeline import RunOptions
-    if args.size == "custom" and (args.width is None or args.height is None):
-        raise SystemExit("error: --size custom requires --width and --height")
-    try:
+    provided = provided or set()
+    if profile is not None and profile.variants:
+        raise SystemExit("error: profiles with output variants require the "
+                         "multi-variant stage and are not supported yet")
+
+    size_explicit = bool({"size", "width", "height", "sizing",
+                          "sizing_value"} & provided)
+    if profile is not None and not size_explicit:
+        if profile.sizing == "resolution":
+            max_w, max_h = profile.width, profile.height
+            sizing = "resolution"
+            sizing_value = 0.0
+        else:
+            # The box is ignored for percent/megapixel modes; keep it a valid
+            # positive placeholder for RunOptions validation.
+            max_w = max_h = 10_000
+            sizing = profile.sizing
+            sizing_value = profile.sizing_value
+    else:
+        if args.size == "custom" and (args.width is None or args.height is None):
+            raise SystemExit("error: --size custom requires --width and --height")
         max_w, max_h = resolve_size(
             None if args.size == "custom" else args.size,
             args.width, args.height)
-        quality = resolve_quality(
-            None if args.quality == "custom" else args.quality,
-            args.jpeg_quality)
-        bg = parse_color(args.bg_color)
+        sizing = args.sizing
+        sizing_value = args.sizing_value
+
+    try:
+        if profile is not None and not ({"quality", "jpeg_quality"} & provided):
+            quality = profile.quality
+        else:
+            quality = resolve_quality(
+                None if args.quality == "custom" else args.quality,
+                args.jpeg_quality)
+        bg_text = (profile.bg_color if profile is not None
+                   and "bg_color" not in provided else args.bg_color)
+        bg = parse_color(bg_text)
+        mode = (profile.mode if profile is not None and "mode" not in provided
+                else args.mode)
+        filter_name = (profile.filter if profile is not None
+                       and "filter" not in provided else args.filter)
+        allow_upscale = (profile.allow_upscale if profile is not None
+                         and "allow_upscale" not in provided
+                         else args.allow_upscale)
+        keep_exif = (profile.keep_exif if profile is not None
+                     and "no_exif" not in provided else not args.no_exif)
+        keep_icc = (profile.keep_icc if profile is not None
+                    and "no_icc" not in provided else not args.no_icc)
+        sub_text = (profile.subsampling if profile is not None
+                    and "subsampling" not in provided else args.subsampling)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
 
-    subsampling = {"auto": None, "444": 0, "422": 1, "420": 2}[args.subsampling]
+    subsampling = {"auto": None, "444": 0, "422": 1, "420": 2}[sub_text]
     if subsampling is None:
         from .presets import auto_subsampling
 
@@ -186,23 +296,23 @@ def _make_options(args, src: Path, dst: Path):
         output_dir=dst,
         max_w=max_w,
         max_h=max_h,
-        mode=args.mode,
+        mode=mode,
         quality=quality,
         subsampling=subsampling,
-        sizing=args.sizing,
-        sizing_value=args.sizing_value,
-        allow_upscale=args.allow_upscale,
+        sizing=sizing,
+        sizing_value=sizing_value,
+        allow_upscale=allow_upscale,
         workers=args.workers,
         batch_size=args.batch_size,
         queue_depth=args.queue_depth,
         skip_existing=args.skip_existing,
         overwrite=overwrite,
         limit=args.limit,
-        keep_exif=not args.no_exif,
-        keep_icc=not args.no_icc,
+        keep_exif=keep_exif,
+        keep_icc=keep_icc,
         bg_color=bg,
         vram_budget_gb=args.vram_budget,
-        filter_name=args.filter,
+        filter_name=filter_name,
         fallback=not args.no_fallback,
         allow_truncated=args.allow_truncated,
         optimize_huffman=args.optimize_huffman,
@@ -437,7 +547,13 @@ def _launch_gui_elsewhere() -> int:
 
 
 def _main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(raw_argv)
+    provided = _provided_dests(raw_argv, parser)
+
+    if args.list_profiles:
+        return _list_profiles()
 
     if args.gui:
         if not _tkinter_available():
@@ -449,13 +565,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.doctor:
         return doctor_report()
 
+    profile = _load_cli_profile(args)
     src, dst = _resolve_paths(args)
     if not src.exists() or not src.is_dir():
         raise SystemExit(f"error: input folder not found: {src}")
     if src.resolve() == dst.resolve():
         raise SystemExit("error: output folder must differ from the input folder")
 
-    opts = _make_options(args, src, dst)
+    opts = _make_options(args, src, dst, profile, provided)
     from .safety import check_roots, reject_links, STATE_NAME, LOCK_NAME
     check_roots(opts.input_dir, opts.output_dir.resolve())
     report_path = Path(args.report).expanduser().absolute() if args.report else opts.output_dir / "report.json"
@@ -473,6 +590,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
     spec = OutputSpec(opts.max_w, opts.max_h, opts.mode, opts.quality,
                       opts.subsampling, opts.allow_upscale)
     print(f"engine       : {kind}")
+    if profile is not None:
+        print(f"profile      : {profile.name} ({profile.id})")
     print(f"output       : {spec.describe()}")
     print(f"input        : {src}")
     print(f"output dir   : {dst}")

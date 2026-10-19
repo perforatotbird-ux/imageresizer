@@ -18,10 +18,14 @@ import time
 import tempfile
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .presets import ALL_QUALITY_PRESETS, SIZE_PRESETS, auto_subsampling
 from .preview import PreviewClient
+from .profiles import (Profile, ProfileError, build_profile, builtin_profiles,
+                       default_profiles_path, export_profile, find_profile,
+                       import_into, load_profiles, read_profile_file,
+                       save_profiles, unique_id, unique_name)
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = PROJECT_DIR / "input"
@@ -131,6 +135,15 @@ class BatchResizeUI(tk.Tk):
         self.stats_var = tk.StringVar(value="")
         self.threads_var = tk.StringVar(value="")
 
+        self.profile_var = tk.StringVar(value="")
+        self.profile_status_var = tk.StringVar(value="Профиль не выбран")
+        self._profiles_path = default_profiles_path()
+        self._user_profiles: list[Profile] = []
+        self._all_profiles: list[Profile] = []
+        self._active_profile_id: str | None = None
+        self._applying_profile = False
+        self._profile_errors: list[str] = []
+
         self.preview_source_var = tk.StringVar(value="")
         self.preview_mode_var = tk.StringVar(value="Результат")
         self.preview_view_var = tk.StringVar(value="fit")
@@ -144,10 +157,14 @@ class BatchResizeUI(tk.Tk):
         self._preview_suspended = False
         self._preview_has_result = False
 
+        self._load_profile_store()
         self._build()
         self._on_quality_change()
         self._on_preset_change()
         self._install_preview_traces()
+        self._install_profile_traces()
+        for error in self._profile_errors:
+            self._log_line(error)
         self.after(100, self._drain_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -163,6 +180,326 @@ class BatchResizeUI(tk.Tk):
         path = filedialog.askdirectory(initialdir=initial)
         if path:
             var.set(path)
+
+    # -- task profiles -------------------------------------------------------
+    def _load_profile_store(self) -> None:
+        self._user_profiles, self._profile_errors = load_profiles(self._profiles_path)
+        combined = builtin_profiles()
+        seen = {profile.id for profile in combined}
+        for profile in self._user_profiles:
+            if profile.id in seen:
+                self._profile_errors.append(
+                    f"Профиль {profile.id!r} совпадает со встроенным и пропущен.")
+                continue
+            combined.append(profile)
+            seen.add(profile.id)
+        self._all_profiles = combined
+        if hasattr(self, "profile_combo"):
+            self.profile_combo["values"] = self._profile_labels()
+            if self._active_profile_id:
+                self._set_profile_selection(self._active_profile_id)
+            else:
+                self.profile_var.set("")
+
+    def _profile_labels(self) -> list[str]:
+        labels: list[str] = []
+        for profile in self._all_profiles:
+            kind = "встроенный" if profile.builtin else "пользовательский"
+            label = f"{profile.name} · {kind}"
+            if label in labels:
+                label = f"{label} [{profile.id}]"
+            labels.append(label)
+        return labels
+
+    def _set_profile_selection(self, profile_id: str) -> None:
+        labels = self._profile_labels()
+        for index, profile in enumerate(self._all_profiles):
+            if profile.id == profile_id:
+                self.profile_combo["values"] = labels
+                self.profile_combo.current(index)
+                self.profile_var.set(labels[index])
+                return
+        self.profile_var.set("")
+
+    def _on_profile_selected(self, _event=None) -> None:
+        index = self.profile_combo.current()
+        if 0 <= index < len(self._all_profiles):
+            self._apply_profile(self._all_profiles[index])
+
+    def _apply_profile(self, profile: Profile) -> None:
+        self._applying_profile = True
+        try:
+            if profile.sizing == "resolution":
+                index = next((i for i, (key, _text) in enumerate(SIZING_MODES)
+                              if key == "resolution"), 0)
+                self.sizing_var.set("resolution")
+                self.sizing_combo.current(index)
+                preset = next((name for name, dims in SIZE_PRESETS.items()
+                               if dims == (profile.width, profile.height)), "custom")
+                self.preset_var.set(preset)
+                self.preset_combo.set(preset)
+                self.width_var.set(str(profile.width))
+                self.height_var.set(str(profile.height))
+            else:
+                index = next((i for i, (key, _text) in enumerate(SIZING_MODES)
+                              if key == profile.sizing), 0)
+                self.sizing_var.set(profile.sizing)
+                self.sizing_combo.current(index)
+                self.preset_var.set("custom")
+                self.preset_combo.set("custom")
+                value = profile.sizing_value
+                self.sizing_value_var.set(
+                    str(int(value)) if float(value).is_integer() else f"{value:g}")
+            self.mode_var.set(profile.mode)
+            self.allow_upscale_var.set(profile.allow_upscale)
+            self.filter_var.set(profile.filter)
+            quality = profile.quality
+            self.jpeg_quality_var.set(str(quality))
+            self.quality_scale.set(quality)
+            match = next(((key, text) for key, text in QUALITY_CHOICES
+                          if ALL_QUALITY_PRESETS[key] == quality), None)
+            if match:
+                self.quality_var.set(match[0])
+                self.quality_combo.set(match[1])
+            else:
+                self.quality_var.set("custom")
+                self.quality_combo.set("")
+            sub_index = next((i for i, (key, _text) in enumerate(SUBSAMPLING_CHOICES)
+                              if key == profile.subsampling), 0)
+            self.subsampling_var.set(profile.subsampling)
+            self.subsampling_combo.current(sub_index)
+            self.bg_color_var.set(profile.bg_color)
+            self.exif_var.set(profile.keep_exif)
+            self.icc_var.set(profile.keep_icc)
+        finally:
+            self._applying_profile = False
+        self._active_profile_id = profile.id
+        self._set_profile_selection(profile.id)
+        note = f"Профиль «{profile.name}» применён"
+        if profile.variants:
+            note += " · варианты появятся после этапа 3"
+        self.profile_status_var.set(note)
+        self._schedule_preview()
+
+    def _install_profile_traces(self) -> None:
+        for var in (self.width_var, self.height_var, self.sizing_var,
+                    self.sizing_value_var, self.mode_var, self.allow_upscale_var,
+                    self.filter_var, self.jpeg_quality_var, self.subsampling_var,
+                    self.bg_color_var, self.exif_var, self.icc_var):
+            var.trace_add("write", self._on_profile_setting_changed)
+
+    def _on_profile_setting_changed(self, *_args) -> None:
+        if self._applying_profile or not self._active_profile_id:
+            return
+        profile = find_profile(self._all_profiles, self._active_profile_id)
+        if profile is not None:
+            self.profile_status_var.set(f"Профиль «{profile.name}» изменён")
+
+    def _profile_values_from_ui(self) -> dict:
+        width = int(self.width_var.get())
+        height = int(self.height_var.get())
+        value = float(self.sizing_value_var.get())
+        quality = int(self.jpeg_quality_var.get())
+        sizing = self.sizing_var.get()
+        if sizing == "resolution":
+            size = {"mode": "resolution", "width": width, "height": height,
+                    "value": None}
+        else:
+            size = {"mode": sizing, "width": None, "height": None, "value": value}
+        return {
+            "size": size,
+            "mode": self.mode_var.get(),
+            "allow_upscale": self.allow_upscale_var.get(),
+            "filter_name": self.filter_var.get(),
+            "quality": quality,
+            "subsampling": self.subsampling_var.get(),
+            "bg_color": self.bg_color_var.get(),
+            "keep_exif": self.exif_var.get(),
+            "keep_icc": self.icc_var.get(),
+        }
+
+    def _profile_from_ui(self, name: str, profile_id: str | None = None) -> Profile:
+        values = self._profile_values_from_ui()
+        return build_profile(
+            name, size=values["size"], mode=values["mode"],
+            allow_upscale=values["allow_upscale"],
+            filter_name=values["filter_name"], quality=values["quality"],
+            subsampling=values["subsampling"], bg_color=values["bg_color"],
+            keep_exif=values["keep_exif"], keep_icc=values["keep_icc"],
+            profile_id=profile_id or unique_id(self._all_profiles, name))
+
+    def _profile_from_profile(self, source: Profile, name: str,
+                              profile_id: str | None = None) -> Profile:
+        return build_profile(
+            name, size=source.size, mode=source.mode,
+            allow_upscale=source.allow_upscale, filter_name=source.filter,
+            quality=source.quality, subsampling=source.subsampling,
+            bg_color=source.bg_color, keep_exif=source.keep_exif,
+            keep_icc=source.keep_icc,
+            profile_id=profile_id or unique_id(self._all_profiles, name),
+            description=source.description, variants=source.variants)
+
+    def _save_profile_store(self) -> bool:
+        try:
+            save_profiles(self._profiles_path, self._user_profiles)
+        except (OSError, ProfileError) as exc:
+            messagebox.showerror("Профили", f"Не удалось сохранить профили:\n{exc}")
+            return False
+        self._load_profile_store()
+        return True
+
+    def _replace_user_profile(self, profile: Profile) -> None:
+        self._user_profiles = [profile if item.id == profile.id else item
+                               for item in self._user_profiles]
+
+    def _save_profile(self) -> None:
+        active = (find_profile(self._all_profiles, self._active_profile_id)
+                  if self._active_profile_id else None)
+        try:
+            if active is not None and not active.builtin:
+                profile = self._profile_from_ui(active.name, profile_id=active.id)
+                self._replace_user_profile(profile)
+            else:
+                initial = f"{active.name} (мой)" if active is not None else "Мой профиль"
+                name = simpledialog.askstring("Сохранить профиль",
+                                              "Название профиля:", initialvalue=initial,
+                                              parent=self)
+                if not name or not name.strip():
+                    return
+                name = name.strip()
+                existing = find_profile(self._user_profiles, name)
+                if existing is not None:
+                    if not messagebox.askyesno(
+                            "Профили", f"Профиль «{existing.name}» уже есть. Заменить?",
+                            parent=self):
+                        return
+                    profile = self._profile_from_ui(name, profile_id=existing.id)
+                    self._replace_user_profile(profile)
+                else:
+                    profile = self._profile_from_ui(name)
+                    self._user_profiles.append(profile)
+        except (ValueError, ProfileError) as exc:
+            messagebox.showerror("Профили", str(exc), parent=self)
+            return
+        if self._save_profile_store():
+            self._set_profile_selection(profile.id)
+            self._apply_profile(profile)
+
+    def _duplicate_profile(self) -> None:
+        active = (find_profile(self._all_profiles, self._active_profile_id)
+                  if self._active_profile_id else None)
+        if active is None:
+            messagebox.showinfo("Профили", "Сначала выберите профиль.", parent=self)
+            return
+        name = simpledialog.askstring("Дублировать профиль", "Название копии:",
+                                      initialvalue=f"{active.name} (копия)",
+                                      parent=self)
+        if not name or not name.strip():
+            return
+        try:
+            profile = self._profile_from_profile(active, name.strip())
+        except (ValueError, ProfileError) as exc:
+            messagebox.showerror("Профили", str(exc), parent=self)
+            return
+        self._user_profiles.append(profile)
+        if self._save_profile_store():
+            self._set_profile_selection(profile.id)
+            self._apply_profile(profile)
+
+    def _rename_profile(self) -> None:
+        active = (find_profile(self._all_profiles, self._active_profile_id)
+                  if self._active_profile_id else None)
+        if active is None or active.builtin:
+            messagebox.showinfo("Профили",
+                                "Выберите пользовательский профиль для переименования.",
+                                parent=self)
+            return
+        name = simpledialog.askstring("Переименовать профиль", "Новое название:",
+                                      initialvalue=active.name, parent=self)
+        if not name or not name.strip() or name.strip() == active.name:
+            return
+        try:
+            profile = self._profile_from_profile(active, name.strip(),
+                                                 profile_id=active.id)
+        except (ValueError, ProfileError) as exc:
+            messagebox.showerror("Профили", str(exc), parent=self)
+            return
+        self._replace_user_profile(profile)
+        if self._save_profile_store():
+            self._set_profile_selection(profile.id)
+            self._apply_profile(profile)
+
+    def _delete_profile(self) -> None:
+        active = (find_profile(self._all_profiles, self._active_profile_id)
+                  if self._active_profile_id else None)
+        if active is None or active.builtin:
+            messagebox.showinfo("Профили",
+                                "Встроенный профиль нельзя удалить. Дублируйте его.",
+                                parent=self)
+            return
+        if not messagebox.askyesno("Удалить профиль",
+                                   f"Удалить профиль «{active.name}»?",
+                                   parent=self):
+            return
+        self._user_profiles = [item for item in self._user_profiles
+                               if item.id != active.id]
+        self._active_profile_id = None
+        self.profile_status_var.set("Профиль не выбран")
+        if self._save_profile_store():
+            self.profile_var.set("")
+
+    def _import_profiles(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Импорт профиля", parent=self,
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            imported = read_profile_file(Path(path))
+        except (OSError, ValueError, ProfileError) as exc:
+            messagebox.showerror("Импорт профиля", str(exc), parent=self)
+            return
+        before = {profile.id for profile in self._user_profiles}
+        existing = [*builtin_profiles(), *self._user_profiles]
+        combined = import_into(existing, imported)
+        self._user_profiles = [profile for profile in combined
+                               if not profile.builtin]
+        if not self._save_profile_store():
+            return
+        added = [profile for profile in self._user_profiles
+                 if profile.id not in before]
+        if added:
+            self._set_profile_selection(added[0].id)
+            self._apply_profile(added[0])
+        messagebox.showinfo("Импорт профиля",
+                            f"Импортировано профилей: {len(added)}", parent=self)
+
+    def _export_profile(self) -> None:
+        profile = (find_profile(self._all_profiles, self._active_profile_id)
+                   if self._active_profile_id else None)
+        if profile is None:
+            name = simpledialog.askstring("Экспорт профиля", "Название профиля:",
+                                          initialvalue="Мой профиль", parent=self)
+            if not name or not name.strip():
+                return
+            try:
+                profile = self._profile_from_ui(name.strip())
+            except (ValueError, ProfileError) as exc:
+                messagebox.showerror("Экспорт профиля", str(exc), parent=self)
+                return
+        path = filedialog.asksaveasfilename(
+            title="Экспорт профиля", parent=self, defaultextension=".json",
+            initialfile=f"{profile.id}.json",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            export_profile(Path(path), profile)
+        except (OSError, ProfileError) as exc:
+            messagebox.showerror("Экспорт профиля", str(exc), parent=self)
+            return
+        messagebox.showinfo("Экспорт профиля",
+                            f"Профиль сохранён:\n{path}", parent=self)
 
     # -- preview -------------------------------------------------------------
     def _install_preview_traces(self) -> None:

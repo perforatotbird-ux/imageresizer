@@ -235,22 +235,38 @@ class ModernView:
 
     def _input(self,p):
         a=self.app
-        self.heading(p,'01','Начнём с ваших файлов','Выберите исходную папку и место для готовых JPEG.')
-        for row,label,var in [(3,'Исходная папка',a.input_var),(5,'Папка результатов',a.output_var)]:
+        self.heading(p,'01','Начнём с ваших файлов','Выберите профиль, исходную папку и место для готовых JPEG.')
+        self.label(p,3,'Профиль задачи')
+        a.profile_combo=self.control(ttk.Combobox(
+            p,state='readonly',values=a._profile_labels(),textvariable=a.profile_var))
+        a.profile_combo.grid(row=4,column=0,sticky='ew')
+        a.profile_combo.bind('<<ComboboxSelected>>',a._on_profile_selected)
+        profile_buttons=ttk.Frame(p)
+        profile_buttons.grid(row=5,column=0,sticky='ew',pady=(8,4))
+        profile_buttons.columnconfigure((0,1),weight=1)
+        for index,(text,command) in enumerate([
+                ('Сохранить',a._save_profile),('Дублировать',a._duplicate_profile),
+                ('Переименовать',a._rename_profile),('Удалить',a._delete_profile),
+                ('Импорт…',a._import_profiles),('Экспорт…',a._export_profile)]):
+            self.control(ttk.Button(profile_buttons,text=text,command=command)).grid(
+                row=index//2,column=index%2,sticky='ew',padx=(0,6),pady=2)
+        ttk.Label(p,textvariable=a.profile_status_var,style='Muted.TLabel',
+                  wraplength=380).grid(row=6,column=0,sticky='w',pady=(2,8))
+        for row,label,var in [(7,'Исходная папка',a.input_var),(9,'Папка результатов',a.output_var)]:
             self.label(p,row,label)
             line=ttk.Frame(p);line.grid(row=row+1,column=0,sticky='ew');line.columnconfigure(0,weight=1)
             self.control(ttk.Entry(line,textvariable=var,width=12)).grid(row=0,column=0,sticky='ew',padx=(0,8))
             self.control(ttk.Button(line,text='Обзор…',command=lambda v=var:a._browse(v))).grid(row=0,column=1)
         info=tk.Frame(p,bg='#EEF4FF',padx=14,pady=12)
-        info.grid(row=7,column=0,sticky='ew',pady=(12,8))
+        info.grid(row=11,column=0,sticky='ew',pady=(12,8))
         tk.Label(info,text='Оригиналы — отдельно',font=('Segoe UI',10,'bold'),fg='#234A87',bg='#EEF4FF',anchor='w').pack(anchor='w')
         tk.Label(info,text='Подпапки сканируются автоматически.\nСтруктура каталогов сохраняется в результате.',font=('Segoe UI',9),fg='#335687',bg='#EEF4FF',justify='left').pack(anchor='w',pady=(5,0))
-        self.label(p,8,'Лимит файлов')
-        line=ttk.Frame(p);line.grid(row=9,column=0,sticky='ew')
+        self.label(p,12,'Лимит файлов')
+        line=ttk.Frame(p);line.grid(row=13,column=0,sticky='ew')
         self.control(ttk.Entry(line,textvariable=a.limit_var,width=9)).pack(side='left')
         ttk.Label(line,text='Пусто — обработать все',style='Muted.TLabel').pack(side='left',padx=12)
-        self.control(ttk.Button(p,text='Посчитать изображения',command=a._count_files)).grid(row=10,column=0,sticky='w',pady=(12,8))
-        ttk.Label(p,textvariable=a.recursive_note,style='Muted.TLabel',wraplength=380).grid(row=11,column=0,sticky='w')
+        self.control(ttk.Button(p,text='Посчитать изображения',command=a._count_files)).grid(row=14,column=0,sticky='w',pady=(12,8))
+        ttk.Label(p,textvariable=a.recursive_note,style='Muted.TLabel',wraplength=380).grid(row=15,column=0,sticky='w')
 
     def _resize_page(self,p):
         a=self.app
