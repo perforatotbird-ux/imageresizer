@@ -109,19 +109,21 @@ def _validate_size(value) -> dict:
 
 
 def _validate_fit(value) -> dict:
-    data = _mapping(value, "fit", {"mode", "allow_upscale", "crop_position"})
+    data = _mapping(value, "fit", {"mode", "allow_upscale", "crop_position", "pad"})
     mode = data.get("mode", "contain")
     if mode not in ("contain", "cover", "pad"):
         _fail("fit.mode", "must be contain, cover or pad")
-    if mode == "pad":
-        _fail("fit.mode", "'pad' is not supported by this version")
+    if mode == "pad" and not data.get("pad", False):
+        _fail("fit.mode", "'pad' is not supported by this version without explicit fit.pad config")
     position = data.get("crop_position", "center")
-    if position != "center":
-        _fail("fit.crop_position", "only 'center' is supported")
+    from .geometry import ANCHORS
+    if str(position).lower() not in ANCHORS:
+        _fail("fit.crop_position", f"unknown crop position {position!r}")
     return {"mode": mode,
             "allow_upscale": _bool(data.get("allow_upscale", False),
                                    "fit.allow_upscale"),
-            "crop_position": position}
+            "crop_position": position,
+            "pad": _bool(data.get("pad", False), "fit.pad") if "pad" in data else False}
 
 
 def _validate_sharpen(value) -> dict:
@@ -296,6 +298,10 @@ class Profile:
     @property
     def allow_upscale(self) -> bool:
         return bool(self.fit["allow_upscale"])
+
+    @property
+    def crop_position(self) -> str:
+        return str(self.fit.get("crop_position", "center"))
 
     @property
     def quality(self) -> int:

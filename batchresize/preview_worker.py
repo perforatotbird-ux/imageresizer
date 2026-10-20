@@ -133,6 +133,11 @@ class PreviewService:
                 linear_light=bool(params.get("linear_light", False)),
                 strip_personal_data=bool(params.get("strip_personal_data", False)),
                 keep_datetime=bool(params.get("keep_datetime", False)),
+                crop_anchor=str(params.get("crop_anchor", "center")),
+                crop_focus=params.get("crop_focus"),
+                max_file_size=params.get("max_file_size"),
+                min_quality=int(params.get("min_quality", 30)),
+                allow_downscale_on_size_limit=bool(params.get("allow_downscale_on_size_limit", False)),
             )
             engine, kind = self._engine_for(
                 backend, opts.filter_name, opts.optimize_huffman)
@@ -178,6 +183,8 @@ class PreviewService:
                 "jpeg_sha256": digest,
                 "out_w": int(out_w),
                 "out_h": int(out_h),
+                "actual_quality": report.get("actual_quality"),
+                "target_size_achieved": report.get("target_size_achieved"),
             }
         finally:
             if run_dir is not None:

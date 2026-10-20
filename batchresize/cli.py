@@ -102,8 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subsampling", default="auto",
                    choices=["auto", "444", "422", "420"],
                    help="chroma subsampling")
-    p.add_argument("--mode", default="contain", choices=["contain", "cover"],
-                   help="contain = fit inside, cover = fill and crop")
+    p.add_argument("--mode", default="contain", choices=["contain", "cover", "pad"],
+                   help="contain = fit inside, cover = fill and crop, pad = fit and pad canvas to target")
+    p.add_argument("--crop-anchor", default="center",
+                   help="anchor for cover/pad modes (center, top, bottom, left, right, top-left, etc.)")
+    p.add_argument("--crop-focus", default=None,
+                   help="normalized focus point 'X,Y' (0.0..1.0) for cover mode crop")
+    p.add_argument("--max-file-size", "--target-size", dest="max_file_size", default=None,
+                   help="maximum target file size limit (e.g. 500KB, 500KiB, 1.5MB)")
+    p.add_argument("--min-quality", type=int, default=30,
+                   help="minimum allowed JPEG quality when compressing to target size (1..100)")
+    p.add_argument("--allow-downscale-on-size-limit", action="store_true",
+                   help="allow downscaling image resolution if target size is unreachable at min-quality")
     p.add_argument("--backend", default="auto",
                    choices=["auto", "gpu", "hybrid", "cpu"],
                    help="processing backend")
@@ -375,6 +385,13 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
     else:
         keep_datetime = False
 
+    crop_anchor = (profile.crop_position if profile is not None and "crop_anchor" not in provided
+                   else args.crop_anchor)
+    crop_focus = args.crop_focus
+    max_file_size = args.max_file_size
+    min_quality = args.min_quality
+    allow_downscale_on_size_limit = args.allow_downscale_on_size_limit
+
     return RunOptions(
         input_dir=src,
         output_dir=dst,
@@ -409,6 +426,11 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         linear_light=linear_light,
         strip_personal_data=strip_personal,
         keep_datetime=keep_datetime,
+        crop_anchor=crop_anchor,
+        crop_focus=crop_focus,
+        max_file_size=max_file_size,
+        min_quality=min_quality,
+        allow_downscale_on_size_limit=allow_downscale_on_size_limit,
     )
 
 

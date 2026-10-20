@@ -157,12 +157,12 @@ class ResumeState:
             with Image.open(io.BytesIO(data)) as im:
                 im.load()
                 return (im.format == 'JPEG' and im.mode == 'RGB' and
-                        im.size == (plan.out_w, plan.out_h))
+                        im.size == (plan.target_w, plan.target_h))
         except (OSError, ValueError):
             return False
 
     def record(self, job, jpeg, src, *, variant_id=None, config_digest=None,
-               out=None, plan=None):
+               out=None, plan=None, actual_quality=None, target_size_achieved=None):
         relative = job.src.relative_to(src).as_posix()
         out = out or job.out
         plan = plan or job.plan
@@ -172,9 +172,14 @@ class ResumeState:
             'source': relative,
             'output': out.relative_to(self.root).as_posix(),
             'output_sha256': hashlib.sha256(jpeg).hexdigest(),
-            'output_w': plan.out_w,
-            'output_h': plan.out_h,
+            'output_w': plan.target_w,
+            'output_h': plan.target_h,
+            'output_bytes': len(jpeg),
         }
+        if actual_quality is not None:
+            entry['actual_quality'] = actual_quality
+        if target_size_achieved is not None:
+            entry['target_size_achieved'] = target_size_achieved
         if variant_id is not None:
             entry['variant'] = variant_id
         self.entries[self._key(relative, variant_id)] = entry

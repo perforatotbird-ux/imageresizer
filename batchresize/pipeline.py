@@ -70,6 +70,11 @@ class RunOptions:
     linear_light: bool = False
     strip_personal_data: bool = False
     keep_datetime: bool = False
+    crop_anchor: str = "center"
+    crop_focus: Optional[Any] = None
+    max_file_size: Optional[int | str] = None
+    min_quality: int = 30
+    allow_downscale_on_size_limit: bool = False
 
     def __post_init__(self):
         self.variants = tuple(self.variants)
@@ -78,9 +83,26 @@ class RunOptions:
         self.input_dir = Path(self.input_dir).resolve()
         self.output_dir = Path(self.output_dir).absolute()
         dimensions(self.max_w, self.max_h)
-        if self.mode not in ("contain", "cover") or self.sizing not in (
+        if self.mode not in ("contain", "cover", "pad") or self.sizing not in (
                 "resolution", "percent", "megapixels", "longest", "shortest"):
             raise ValueError("unknown sizing/mode")
+        from .geometry import ANCHORS, parse_crop_focus
+        anchor_key = str(self.crop_anchor).lower().strip()
+        if anchor_key not in ANCHORS:
+            raise ValueError(f"unknown crop anchor {self.crop_anchor!r}")
+        object.__setattr__(self, "crop_anchor", anchor_key)
+        if self.crop_focus is not None:
+            object.__setattr__(self, "crop_focus", parse_crop_focus(self.crop_focus))
+        if self.max_file_size is not None:
+            from .size_limit import parse_size_bytes
+            # Validate size parseability
+            parsed_bytes = parse_size_bytes(self.max_file_size)
+            object.__setattr__(self, "max_file_size", parsed_bytes)
+        if (isinstance(self.min_quality, bool) or int(self.min_quality) != self.min_quality or
+                not 1 <= self.min_quality <= 100):
+            raise ValueError("min_quality must be an integer between 1 and 100")
+        if not isinstance(self.allow_downscale_on_size_limit, bool):
+            raise ValueError("allow_downscale_on_size_limit must be a boolean")
         if self.sizing != "resolution":
             positive(self.sizing_value, "sizing value")
         positive(self.vram_budget_gb, "VRAM budget")
@@ -95,6 +117,8 @@ class RunOptions:
                 not 1 <= self.quality <= 100 or isinstance(self.subsampling, bool) or
                 self.subsampling not in (0, 1, 2)):
             raise ValueError("invalid JPEG quality/subsampling")
+        if self.min_quality > self.quality:
+            raise ValueError("min_quality cannot be greater than quality")
         from .resampling import SUPPORTED_FILTERS
         if self.filter_name not in SUPPORTED_FILTERS:
             raise ValueError("unknown filter")
@@ -152,6 +176,8 @@ class Result:
     timings: dict = field(default_factory=dict)
     variant_id: Optional[str] = None
     plan: Optional[Plan] = None
+    actual_quality: Optional[int] = None
+    target_size_achieved: Optional[bool] = None
 
 
 class Stats:
@@ -372,6 +398,7 @@ class Pipeline:
         self.jobs: queue.Queue = queue.Queue(maxsize=max(1, opts.queue_depth))
         self.results: queue.Queue = queue.Queue(maxsize=max(1, opts.queue_depth))
         self.discovered = 0
+        self._target_size_achieved: Optional[bool] = None
         self.t_start = 0.0
         self._progress_enabled = progress
         self._last_progress = 0.0
@@ -577,7 +604,9 @@ class Pipeline:
                             self.opts.sizing_value)
                         plan = make_plan(meta.display_width, meta.display_height,
                                          box_w, box_h,
-                                         self.opts.mode, self.opts.allow_upscale)
+                                         self.opts.mode, self.opts.allow_upscale,
+                                         anchor=self.opts.crop_anchor,
+                                         focus=self.opts.crop_focus)
                         tasks.append(OutputTask(
                             None, targets[None], plan, self.opts.quality,
                             self.opts.subsampling, self._resume.fingerprint))
@@ -701,7 +730,9 @@ class Pipeline:
                         res.job, res.jpeg, self.opts.input_dir,
                         variant_id=res.variant_id,
                         config_digest=self._task_digest(res),
-                        out=res.out, plan=res.plan)
+                        out=res.out, plan=res.plan,
+                        actual_quality=res.actual_quality,
+                        target_size_achieved=res.target_size_achieved)
                     self._terminal.add((res.job.src, res.variant_id))
                 self.stats.add(res, time.perf_counter() - t0)
             except Exception as exc:
@@ -711,7 +742,7 @@ class Pipeline:
 
     # -- processing ----------------------------------------------------------
     def _finish(self, job: Job, second, third=None, fourth=None,
-                fifth="cpu") -> None:
+                fifth="cpu", actual_quality=None, target_size_achieved=None) -> None:
         if isinstance(second, OutputTask):
             task, jpeg, timings, backend = second, third, fourth or {}, fifth
         else:
@@ -740,7 +771,7 @@ class Pipeline:
                 jpeg,
                 job.meta.exif if self.opts.keep_exif else None,
                 output_icc,
-                dimensions=(task.plan.out_w, task.plan.out_h),
+                dimensions=(task.plan.target_w, task.plan.target_h),
                 strip_personal=self.opts.strip_personal_data,
                 keep_datetime=self.opts.keep_datetime,
             )
@@ -752,8 +783,15 @@ class Pipeline:
             if key in self._terminal or key in self._pending:
                 return
             self._pending.add(key)
-        res = Result(job, jpeg, task.out, task.plan.out_w, task.plan.out_h,
-                     backend, timings, task.variant_id, task.plan)
+            if target_size_achieved is not None:
+                if self._target_size_achieved is None:
+                    self._target_size_achieved = target_size_achieved
+                else:
+                    self._target_size_achieved = self._target_size_achieved and target_size_achieved
+        res = Result(job, jpeg, task.out, task.plan.target_w, task.plan.target_h,
+                     backend, timings, task.variant_id, task.plan,
+                     actual_quality=actual_quality,
+                     target_size_achieved=target_size_achieved)
         if not self._put_result(res):
             self._fail_output(job, task, RuntimeError(
                 "worker failure prevented publication"))
@@ -836,13 +874,109 @@ class Pipeline:
                     if self.opts.sharpen.enabled:
                         from .sharpen import apply_sharpen
                         small = apply_sharpen(small, self.opts.sharpen)
+                    if task.plan.is_pad:
+                        from .geometry import apply_pad
+                        small = apply_pad(small, task.plan, self.opts.bg_color)
                     t4 = time.perf_counter()
-                    jpeg = engine.encode(small, task.quality, task.subsampling)
+
+                    actual_quality = task.quality
+                    target_size_achieved = None
+                    if self.opts.max_file_size:
+                        from .size_limit import optimize_jpeg_quality, parse_size_bytes
+                        max_bytes = parse_size_bytes(self.opts.max_file_size)
+
+                        def splice_check(j: bytes) -> bytes:
+                            output_icc = None
+                            if self.opts.keep_icc:
+                                from .color_management import SRGB_ICC_BYTES, COLOR_POLICY_SRGB
+                                if self.opts.color_policy == COLOR_POLICY_SRGB:
+                                    output_icc = SRGB_ICC_BYTES
+                                elif job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"):
+                                    output_icc = SRGB_ICC_BYTES
+                                elif job.meta.icc:
+                                    output_icc = job.meta.icc
+                            if self.opts.keep_exif or self.opts.keep_icc or self.opts.strip_personal_data:
+                                return splice_metadata(
+                                    j,
+                                    job.meta.exif if self.opts.keep_exif else None,
+                                    output_icc,
+                                    dimensions=(task.plan.target_w, task.plan.target_h),
+                                    strip_personal=self.opts.strip_personal_data,
+                                    keep_datetime=self.opts.keep_datetime,
+                                )
+                            return j
+
+                        def encode_fn(im, q):
+                            return engine.encode(im, q, task.subsampling)
+
+                        jpeg, actual_quality, target_size_achieved = optimize_jpeg_quality(
+                            encode_fn,
+                            small,
+                            initial_quality=task.quality,
+                            min_quality=self.opts.min_quality,
+                            max_bytes=max_bytes,
+                            splice_fn=splice_check,
+                        )
+
+                        if not target_size_achieved and self.opts.allow_downscale_on_size_limit:
+                            import cv2
+                            curr_img = small
+                            for scale_factor in (0.85, 0.70, 0.50, 0.35, 0.25):
+                                nw = max(8, int(round(small.shape[1] * scale_factor)))
+                                nh = max(8, int(round(small.shape[0] * scale_factor)))
+                                if nw >= curr_img.shape[1] and nh >= curr_img.shape[0]:
+                                    continue
+                                curr_img = cv2.resize(small, (nw, nh), interpolation=cv2.INTER_AREA)
+                                trial_jpeg, trial_q, trial_achieved = optimize_jpeg_quality(
+                                    encode_fn,
+                                    curr_img,
+                                    initial_quality=task.quality,
+                                    min_quality=self.opts.min_quality,
+                                    max_bytes=max_bytes,
+                                    splice_fn=splice_check,
+                                    max_trials=4,
+                                    max_seconds=1.0,
+                                )
+                                if trial_achieved:
+                                    jpeg = trial_jpeg
+                                    actual_quality = trial_q
+                                    target_size_achieved = True
+                                    task = OutputTask(
+                                        task.variant_id,
+                                        task.out,
+                                        Plan(
+                                            src_w=task.plan.src_w,
+                                            src_h=task.plan.src_h,
+                                            out_w=nw,
+                                            out_h=nh,
+                                            x0=task.plan.x0,
+                                            y0=task.plan.y0,
+                                            cw=task.plan.cw,
+                                            ch=task.plan.ch,
+                                            canvas_w=nw if task.plan.is_pad else 0,
+                                            canvas_h=nh if task.plan.is_pad else 0,
+                                            pad_left=0,
+                                            pad_top=0,
+                                        ),
+                                        task.quality,
+                                        task.subsampling,
+                                        task.config_digest,
+                                    )
+                                    break
+
+                        if not target_size_achieved and len(self._warnings) < 50:
+                            self._warnings.append(
+                                f"{job.src}: target file size {max_bytes} bytes unreachable at min_quality {self.opts.min_quality} (actual {len(jpeg)} bytes)"
+                            )
+                    else:
+                        jpeg = engine.encode(small, task.quality, task.subsampling)
                     t5 = time.perf_counter()
                     timings = {"decode": (t1 - t0) / count,
                                "normalize": (t2 - t1) / count,
                                "resize": t4 - t3, "encode": t5 - t4}
-                    self._finish(job, task, jpeg, timings, backend)
+                    self._finish(job, task, jpeg, timings, backend,
+                                 actual_quality=actual_quality,
+                                 target_size_achieved=target_size_achieved)
                 except Exception as exc:
                     self._fail_output(job, task, exc)
                     self._complete_output(job.src)
@@ -880,6 +1014,14 @@ class Pipeline:
         if self.opts.linear_light:
             for job in batch:
                 self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
+            return
+        if self.opts.mode == "pad" or any(t.plan.is_pad for j in batch for t in self._job_tasks(j)):
+            for job in batch:
+                self._gpu_fallback(job, RuntimeError("pad mode is not supported on GPU backend"))
+            return
+        if self.opts.max_file_size:
+            for job in batch:
+                self._gpu_fallback(job, RuntimeError("target file size limit is not supported on GPU backend"))
             return
         # Managed colour conversion cannot copy a CMYK/gray profile onto RGB.
         from .color_management import COLOR_POLICY_SRGB
@@ -945,6 +1087,12 @@ class Pipeline:
             return
         if self.opts.linear_light:
             self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
+            return
+        if self.opts.mode == "pad" or any(t.plan.is_pad for t in self._job_tasks(job)):
+            self._gpu_fallback(job, RuntimeError("pad mode is not supported on GPU backend"))
+            return
+        if self.opts.max_file_size:
+            self._gpu_fallback(job, RuntimeError("target file size limit is not supported on GPU backend"))
             return
         try:
             with self._working(job):
@@ -1112,7 +1260,8 @@ class Pipeline:
         config = {k: getattr(opts, k) for k in ("max_w", "max_h", "mode", "quality",
             "subsampling", "sizing", "sizing_value", "allow_upscale", "filter_name",
             "bg_color", "keep_exif", "keep_icc", "optimize_huffman",
-            "color_policy", "linear_light", "strip_personal_data", "keep_datetime")}
+            "color_policy", "linear_light", "strip_personal_data", "keep_datetime",
+            "crop_anchor", "crop_focus", "max_file_size", "min_quality", "allow_downscale_on_size_limit")}
         config["sharpen"] = opts.sharpen.to_dict()
         from . import __version__
         from importlib.metadata import version, PackageNotFoundError
@@ -1277,6 +1426,13 @@ class Pipeline:
             "linear_light": self.opts.linear_light,
             "strip_personal_data": self.opts.strip_personal_data,
             "keep_datetime": self.opts.keep_datetime,
+            "mode": self.opts.mode,
+            "crop_anchor": self.opts.crop_anchor,
+            "crop_focus": self.opts.crop_focus,
+            "max_file_size": self.opts.max_file_size,
+            "min_quality": self.opts.min_quality,
+            "allow_downscale_on_size_limit": self.opts.allow_downscale_on_size_limit,
+            "target_size_achieved": self._target_size_achieved,
             "discovered": self.discovered,
             "sources_total": self.discovered,
             "sources_complete": sources_complete,
