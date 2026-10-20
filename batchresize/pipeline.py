@@ -66,6 +66,10 @@ class RunOptions:
     cancel_file: Optional[Path] = None
     variants: tuple[OutputVariant, ...] = ()
     sharpen: Any = None
+    color_policy: str = "preserve_rgb"
+    linear_light: bool = False
+    strip_personal_data: bool = False
+    keep_datetime: bool = False
 
     def __post_init__(self):
         self.variants = tuple(self.variants)
@@ -97,6 +101,14 @@ class RunOptions:
         from .sharpen import SharpenConfig, parse_sharpen
         if not isinstance(self.sharpen, SharpenConfig):
             object.__setattr__(self, "sharpen", parse_sharpen(self.sharpen))
+        from .color_management import canonical_color_policy
+        object.__setattr__(self, "color_policy", canonical_color_policy(self.color_policy))
+        if not isinstance(self.linear_light, bool):
+            raise ValueError("linear_light must be a boolean")
+        if not isinstance(self.strip_personal_data, bool):
+            raise ValueError("strip_personal_data must be a boolean")
+        if not isinstance(self.keep_datetime, bool):
+            raise ValueError("keep_datetime must be a boolean")
         if len(self.bg_color) != 3 or any(int(x) != x or not 0 <= x <= 255 for x in self.bg_color):
             raise ValueError("background must contain three bytes")
         for name in ("max_source_bytes", "max_queued_bytes", "max_working_bytes"):
@@ -712,15 +724,29 @@ class Pipeline:
             if key in self._terminal or key in self._pending:
                 return
         t0 = time.perf_counter()
-        icc = job.meta.icc
-        if icc and job.meta.mode not in ("RGB", "RGBA", "P"):
-            from PIL import ImageCms
-            icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-        if self.opts.keep_exif or self.opts.keep_icc:
+        from .color_management import SRGB_ICC_BYTES, COLOR_POLICY_SRGB
+        output_icc = None
+        if self.opts.keep_icc:
+            if self.opts.color_policy == COLOR_POLICY_SRGB:
+                output_icc = SRGB_ICC_BYTES
+            elif job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"):
+                output_icc = SRGB_ICC_BYTES
+            elif job.meta.icc:
+                output_icc = job.meta.icc
+
+        if self.opts.keep_exif or self.opts.keep_icc or self.opts.strip_personal_data:
             # Fail this file visibly rather than attach stale EXIF/ICC or drop it silently.
-            jpeg = splice_metadata(jpeg, job.meta.exif if self.opts.keep_exif else None,
-                    icc if self.opts.keep_icc else None,
-                    dimensions=(task.plan.out_w, task.plan.out_h))
+            jpeg = splice_metadata(
+                jpeg,
+                job.meta.exif if self.opts.keep_exif else None,
+                output_icc,
+                dimensions=(task.plan.out_w, task.plan.out_h),
+                strip_personal=self.opts.strip_personal_data,
+                keep_datetime=self.opts.keep_datetime,
+            )
+        if self.opts.strip_personal_data:
+            from .imageio_meta import verify_metadata_sanitized
+            verify_metadata_sanitized(jpeg, keep_datetime=self.opts.keep_datetime)
         timings["metadata"] = time.perf_counter() - t0
         with self._state_lock:
             if key in self._terminal or key in self._pending:
@@ -736,25 +762,77 @@ class Pipeline:
     def _process_cpu_one(self, job: Job, engine=None, backend="cpu") -> None:
         engine = engine or self.engine
         try:
+            import numpy as np
+            from .color_management import (
+                decode_and_manage_color,
+                srgb_to_linear,
+                linear_to_srgb,
+                premultiply_alpha,
+                composite_linear_bg,
+                COLOR_POLICY_SRGB,
+            )
+            from .resampling import separable_resample_float
+
             t0 = time.perf_counter()
-            if job.has_alpha or (job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P")):
-                rgb, _ = decode_to_rgb(job.data)
-                img = rgb[:, :, [2, 1, 0, 3]] if rgb.shape[2] == 4 else rgb[:, :, ::-1]
-                import numpy as np
+            needs_cms = (
+                self.opts.color_policy == COLOR_POLICY_SRGB
+                or self.opts.linear_light
+                or job.has_alpha
+                or (job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"))
+                or job.meta.mode not in ("RGB", "RGBA")
+            )
+            if needs_cms:
+                img_rgb, has_alpha, _ = decode_and_manage_color(
+                    job.data, self.opts.color_policy, self.opts.keep_icc
+                )
+                if img_rgb.shape[2] == 4:
+                    img = img_rgb[:, :, [2, 1, 0, 3]]
+                else:
+                    img = img_rgb[:, :, ::-1]
                 img = np.ascontiguousarray(img)
             else:
                 img = engine.decode(job.data)
+                has_alpha = False
             t1 = time.perf_counter()
-            if img.shape[2] == 4 or job.has_alpha:
-                img = engine.composite_bg(img, self.opts.bg_color)
-            img = engine.apply_orientation(img, job.meta.orientation)
+
+            if not self.opts.linear_light:
+                if img.shape[2] == 4 or job.has_alpha or has_alpha:
+                    img = engine.composite_bg(img, self.opts.bg_color)
+                img = engine.apply_orientation(img, job.meta.orientation)
+            else:
+                img = engine.apply_orientation(img, job.meta.orientation)
+
             t2 = time.perf_counter()
             tasks = self._job_tasks(job)
             count = max(1, len(tasks))
             for task in tasks:
                 try:
                     t3 = time.perf_counter()
-                    small = engine.resize(img, task.plan)
+                    if self.opts.linear_light:
+                        bgr = img[:, :, :3]
+                        rgb = bgr[:, :, ::-1]
+                        rgb_lin = srgb_to_linear(rgb)
+                        if img.shape[2] == 4 or job.has_alpha or has_alpha:
+                            alpha = img[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+                            rgba_lin = np.concatenate([rgb_lin, alpha], axis=2)
+                            rgba_premul = premultiply_alpha(rgba_lin)
+                            res_premul = separable_resample_float(
+                                rgba_premul, task.plan, self.opts.filter_name
+                            )
+                            comp_lin = composite_linear_bg(
+                                res_premul, self.opts.bg_color, is_premultiplied=True
+                            )
+                            small_rgb = linear_to_srgb(comp_lin)
+                            small = small_rgb[:, :, ::-1]
+                        else:
+                            res_lin = separable_resample_float(
+                                rgb_lin, task.plan, self.opts.filter_name
+                            )
+                            small_rgb = linear_to_srgb(res_lin)
+                            small = small_rgb[:, :, ::-1]
+                    else:
+                        small = engine.resize(img, task.plan)
+
                     if self.opts.sharpen.enabled:
                         from .sharpen import apply_sharpen
                         small = apply_sharpen(small, self.opts.sharpen)
@@ -799,8 +877,16 @@ class Pipeline:
             for job in batch:
                 self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
             return
+        if self.opts.linear_light:
+            for job in batch:
+                self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
+            return
         # Managed colour conversion cannot copy a CMYK/gray profile onto RGB.
-        managed = [j for j in batch if j.meta.icc and j.meta.mode not in ("RGB", "RGBA", "P")]
+        from .color_management import COLOR_POLICY_SRGB
+        if self.opts.color_policy == COLOR_POLICY_SRGB:
+            managed = [j for j in batch if j.meta.icc or j.meta.mode not in ("RGB", "RGBA")]
+        else:
+            managed = [j for j in batch if j.meta.icc and j.meta.mode not in ("RGB", "RGBA", "P")]
         for job in managed:
             self._process_hybrid_one(job)
         batch = [j for j in batch if j not in managed]
@@ -856,6 +942,9 @@ class Pipeline:
     def _process_hybrid_one(self, job):
         if self.opts.sharpen.enabled:
             self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
+            return
+        if self.opts.linear_light:
+            self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
             return
         try:
             with self._working(job):
@@ -1022,7 +1111,8 @@ class Pipeline:
             raise ValueError("input directory does not exist")
         config = {k: getattr(opts, k) for k in ("max_w", "max_h", "mode", "quality",
             "subsampling", "sizing", "sizing_value", "allow_upscale", "filter_name",
-            "bg_color", "keep_exif", "keep_icc", "optimize_huffman")}
+            "bg_color", "keep_exif", "keep_icc", "optimize_huffman",
+            "color_policy", "linear_light", "strip_personal_data", "keep_datetime")}
         config["sharpen"] = opts.sharpen.to_dict()
         from . import __version__
         from importlib.metadata import version, PackageNotFoundError
@@ -1183,6 +1273,10 @@ class Pipeline:
             "engine": self.backend,
             "filter": self.opts.filter_name,
             "sharpen": self.opts.sharpen.to_dict(),
+            "color_policy": self.opts.color_policy,
+            "linear_light": self.opts.linear_light,
+            "strip_personal_data": self.opts.strip_personal_data,
+            "keep_datetime": self.opts.keep_datetime,
             "discovered": self.discovered,
             "sources_total": self.discovered,
             "sources_complete": sources_complete,

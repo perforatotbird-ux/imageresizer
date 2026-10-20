@@ -82,6 +82,17 @@ def test_stage4_values_are_accepted():
     assert profile.sharpen["enabled"] is True
 
 
+def test_stage5_values_are_accepted():
+    data = builtin("builtin-web-photo").to_dict()
+    data["color"] = {"policy": "web_srgb", "linear_light": True}
+    data["metadata"] = {"exif": True, "icc": True, "strip_personal": True, "keep_datetime": True}
+    profile = profiles.parse_profile(data)
+    assert profile.color_policy == "web_srgb"
+    assert profile.linear_light is True
+    assert profile.strip_personal_data is True
+    assert profile.keep_datetime is True
+
+
 def test_resolution_requires_both_dimensions():
     data = builtin("builtin-web-photo").to_dict()
     data["size"]["height"] = None

@@ -92,19 +92,91 @@ def is_truncated_jpeg(data: bytes) -> bool:
     return True
 
 
-def _strip_orientation(exif_bytes: bytes, dimensions=None) -> bytes:
-    """Normalize EXIF or raise; never attach stale orientation on failure."""
+# Personal and sensitive EXIF tags
+PERSONAL_ZEROTH_TAGS = {
+    0x010E,  # ImageDescription
+    0x013B,  # Artist
+    0x8298,  # Copyright
+    0x0131,  # Software
+    0x02BC,  # XMLPacket (embedded XMP)
+}
+
+PERSONAL_EXIF_TAGS = {
+    0x9286,  # UserComment
+    0xA420,  # ImageUniqueID
+    0xA430,  # CameraOwnerName
+    0xA431,  # BodySerialNumber
+    0xA432,  # LensSpecification
+    0xA433,  # LensMake
+    0xA434,  # LensModel
+    0xA435,  # LensSerialNumber
+}
+
+DATETIME_ZEROTH_TAGS = {
+    0x0132,  # DateTime
+}
+
+DATETIME_EXIF_TAGS = {
+    0x9003,  # DateTimeOriginal
+    0x9004,  # DateTimeDigitized
+    0x9010,  # OffsetTime
+    0x9011,  # OffsetTimeOriginal
+    0x9012,  # OffsetTimeDigitized
+    0x9290,  # SubSecTime
+    0x9291,  # SubSecTimeOriginal
+    0x9292,  # SubSecTimeDigitized
+}
+
+
+def clean_exif(
+    exif_bytes: bytes,
+    dimensions=None,
+    strip_personal: bool = False,
+    keep_datetime: bool = False,
+) -> bytes:
+    """Normalize orientation to 1, update dimensions, zero thumbnails,
+    and optionally strip personal data (GPS, serials, author, comments, date)."""
     import piexif
-    ex = piexif.load(exif_bytes)
+    try:
+        ex = piexif.load(exif_bytes)
+    except Exception as exc:
+        raise ValueError(f"cannot parse EXIF bytes: {exc}") from exc
+
     ex.setdefault("0th", {})[ORIENTATION_TAG] = 1
-    ex["1st"] = {}; ex["thumbnail"] = None
+    ex["1st"] = {}
+    ex["thumbnail"] = None
+    ex["Interop"] = {}
+
     if dimensions is not None:
         w, h = dimensions
-        ex["0th"][256] = w; ex["0th"][257] = h
-        ex.setdefault("Exif", {})[40962] = w
-        ex["Exif"][40963] = h
+        ex["0th"][256] = int(w)
+        ex["0th"][257] = int(h)
+        ex.setdefault("Exif", {})[40962] = int(w)
+        ex["Exif"][40963] = int(h)
+
+    if strip_personal:
+        ex["GPS"] = {}
+        zeroth = ex.get("0th", {})
+        for tag in PERSONAL_ZEROTH_TAGS:
+            zeroth.pop(tag, None)
+        if not keep_datetime:
+            for tag in DATETIME_ZEROTH_TAGS:
+                zeroth.pop(tag, None)
+
+        exif_ifd = ex.get("Exif", {})
+        for tag in PERSONAL_EXIF_TAGS:
+            exif_ifd.pop(tag, None)
+        if not keep_datetime:
+            for tag in DATETIME_EXIF_TAGS:
+                exif_ifd.pop(tag, None)
+
     blob = piexif.dump(ex)
     return blob[6:] if blob.startswith(b"Exif\x00\x00") else blob
+
+
+def _strip_orientation(exif_bytes: bytes, dimensions=None) -> bytes:
+    """Normalize EXIF or raise; never attach stale orientation on failure."""
+    return clean_exif(exif_bytes, dimensions=dimensions, strip_personal=False)
 
 
 def _icc_chunks(icc: bytes) -> list[bytes]:
@@ -125,33 +197,12 @@ def _app_segment(marker: int, payload: bytes) -> bytes:
     return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
 
 
-def splice_metadata(jpeg: bytes, exif: Optional[bytes],
-                    icc: Optional[bytes], dimensions=None) -> bytes:
-    """Insert EXIF/ICC into an encoded JPEG right after SOI.
+def _strip_app_segments(jpeg: bytes, strip_personal: bool = False) -> bytes:
+    """Remove APP1/APP2 segments that precede the first SOS, plus APP13/COM if strip_personal."""
+    drop_markers = {0xE1, 0xE2}
+    if strip_personal:
+        drop_markers.update({0xED, 0xFE})  # APP13 (IPTC/Photoshop), COM (Comment)
 
-    Any APP1/APP2 segments already present in ``jpeg`` are removed first so
-    the result has exactly one EXIF block and one ICC block.
-    """
-    if not exif and not icc:
-        return jpeg
-    if not jpeg.startswith(b"\xFF\xD8"):
-        raise ValueError("not a JPEG stream")
-
-    cleaned = _strip_app12(jpeg)
-
-    segments = b""
-    if exif:
-        payload = b"Exif\x00\x00" + _strip_orientation(exif, dimensions)
-        segments += _app_segment(0xE1, payload)
-    if icc:
-        for chunk in _icc_chunks(icc):
-            segments += _app_segment(0xE2, chunk)
-
-    return cleaned[:2] + segments + cleaned[2:]
-
-
-def _strip_app12(jpeg: bytes) -> bytes:
-    """Remove APP1/APP2 segments that precede the first SOS."""
     out = bytearray(jpeg[:2])
     i = 2
     n = len(jpeg)
@@ -168,11 +219,107 @@ def _strip_app12(jpeg: bytes) -> bytes:
             return bytes(out)
         seg_len = struct.unpack(">H", jpeg[i + 2:i + 4])[0]
         seg = jpeg[i:i + 2 + seg_len]
-        if marker not in (0xE1, 0xE2):
+        if marker not in drop_markers:
             out += seg
         i += 2 + seg_len
     out += jpeg[i:]
     return bytes(out)
+
+
+def _strip_app12(jpeg: bytes) -> bytes:
+    """Remove APP1/APP2 segments that precede the first SOS."""
+    return _strip_app_segments(jpeg, strip_personal=False)
+
+
+def splice_metadata(jpeg: bytes, exif: Optional[bytes],
+                    icc: Optional[bytes], dimensions=None,
+                    strip_personal: bool = False,
+                    keep_datetime: bool = False) -> bytes:
+    """Insert EXIF/ICC into an encoded JPEG right after SOI.
+
+    Any APP1/APP2 segments already present in ``jpeg`` are removed first so
+    the result has exactly one EXIF block and one ICC block.
+    If ``strip_personal`` is True, personal EXIF tags and APP13/COM are stripped.
+    """
+    if not exif and not icc and not strip_personal:
+        return jpeg
+    if not jpeg.startswith(b"\xFF\xD8"):
+        raise ValueError("not a JPEG stream")
+
+    cleaned = _strip_app_segments(jpeg, strip_personal=strip_personal)
+
+    segments = b""
+    if exif:
+        cleaned_exif = clean_exif(
+            exif,
+            dimensions=dimensions,
+            strip_personal=strip_personal,
+            keep_datetime=keep_datetime,
+        )
+        payload = b"Exif\x00\x00" + cleaned_exif
+        segments += _app_segment(0xE1, payload)
+    if icc:
+        for chunk in _icc_chunks(icc):
+            segments += _app_segment(0xE2, chunk)
+
+    return cleaned[:2] + segments + cleaned[2:]
+
+
+def verify_metadata_sanitized(jpeg: bytes, keep_datetime: bool = False) -> None:
+    """Read back output JPEG and assert that no personal metadata leaked."""
+    if not jpeg.startswith(b"\xFF\xD8"):
+        raise ValueError("not a JPEG stream")
+
+    i = 2
+    n = len(jpeg)
+    exif_payload: Optional[bytes] = None
+    while i + 4 <= n:
+        if jpeg[i] != 0xFF:
+            break
+        marker = jpeg[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if marker == 0xDA:  # SOS
+            break
+        seg_len = struct.unpack(">H", jpeg[i + 2:i + 4])[0]
+        seg = jpeg[i + 4:i + 2 + seg_len]
+        if marker == 0xED:
+            raise ValueError("personal metadata leak: found APP13 (IPTC/Photoshop) segment")
+        if marker == 0xFE:
+            raise ValueError("personal metadata leak: found COM (Comment) segment")
+        if marker == 0xE1:
+            if seg.startswith(b"Exif\x00\x00"):
+                exif_payload = seg[6:]
+            elif b"http://ns.adobe.com/xap" in seg or b"<x:xmpmeta" in seg:
+                raise ValueError("personal metadata leak: found XMP segment in APP1")
+        i += 2 + seg_len
+
+    if exif_payload is not None:
+        import piexif
+        ex = piexif.load(exif_payload)
+        if len(ex.get("GPS", {})) > 0:
+            raise ValueError(f"personal metadata leak: GPS tags found ({list(ex['GPS'].keys())})")
+        if ex.get("thumbnail") is not None:
+            raise ValueError("personal metadata leak: thumbnail found in EXIF")
+
+        zeroth = ex.get("0th", {})
+        found_zeroth = [tag for tag in PERSONAL_ZEROTH_TAGS if tag in zeroth]
+        if found_zeroth:
+            raise ValueError(f"personal metadata leak: 0th tags found ({found_zeroth})")
+        if not keep_datetime:
+            found_dt_zeroth = [tag for tag in DATETIME_ZEROTH_TAGS if tag in zeroth]
+            if found_dt_zeroth:
+                raise ValueError(f"personal metadata leak: DateTime tags found ({found_dt_zeroth})")
+
+        exif_ifd = ex.get("Exif", {})
+        found_exif = [tag for tag in PERSONAL_EXIF_TAGS if tag in exif_ifd]
+        if found_exif:
+            raise ValueError(f"personal metadata leak: Exif tags found ({found_exif})")
+        if not keep_datetime:
+            found_dt_exif = [tag for tag in DATETIME_EXIF_TAGS if tag in exif_ifd]
+            if found_dt_exif:
+                raise ValueError(f"personal metadata leak: DateTime tags found ({found_dt_exif})")
 
 
 def png_has_alpha(data: bytes) -> bool:

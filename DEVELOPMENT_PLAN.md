@@ -425,9 +425,39 @@
   - Полный регрессионный прогон: 263 passed, 4 skipped.
 - `[x]` CLI-smoke: проверен на `testdata/photos` с `--filter mitchell --sharpen standard`.
 
-### Этапы 5–8 — `[ ]` не начаты
+### Этап 5 — цвет, прозрачность, метаданные (P1) — `[x]` готово, подтверждено прогоном
 
-`[~]` Цвет/прозрачность (этап 5), ограничение по объёму и crop/pad (этап 6), PNG/WebP (этап 7), измеряемая оптимизация и benchmark-протокол (этап 8) — реализация не начиналась.
+Успешно реализовано и проверено:
+
+- `[x]` Модуль `batchresize/color_management.py`:
+  - Цветовые политики: `preserve_rgb` (сохранение пространства источника и его оригинального ICC) и `web_srgb` (CMS-преобразование в sRGB и встраивание sRGB профиля).
+  - Для CMYK и Grayscale выполняется корректное преобразование в sRGB с заменой профиля на sRGB; сохранение устаревшего профиля CMYK на RGB пикселях исключено.
+  - Строгая валидация ICC: повреждённые или невалидные профили безопасно отклоняются до ресайза.
+  - Точные преобразования sRGB $\leftrightarrow$ Linear Light (IEC 61966-2-1) с табличным ускорением (LUT).
+  - Поддержка premultiplied alpha в `premultiply_alpha` и безопасного `unpremultiply_alpha` с защитой от деления на 0 при нулевой прозрачности.
+  - Композитинг фона в пространстве линейного света (`composite_linear_bg`) полностью исключает тёмные ореолы (dark halos) на полупрозрачных цветных краях.
+- `[x]` Санитизация и верификация метаданных (`batchresize/imageio_meta.py`):
+  - `clean_exif`: удаляет GPS-координаты, серийные номера камеры и объектива, имя владельца, имя автора/фотографа, комментарии, embedded XMP.
+  - Дата съёмки удаляется по умолчанию и сохраняется только при явном флаге `--keep-datetime`.
+  - Удаление сегментов APP13 (IPTC/Photoshop) и COM (Comment).
+  - Сохранение параметров экспозиции, диафрагмы, фокусного расстояния, производителя и модели камеры.
+  - Функция `verify_metadata_sanitized` проверяет сформированный JPEG на отсутствие любых утечек персональных метаданных перед записью на диск.
+- `[x]` Интеграция в конвейер и CLI:
+  - Флаги CLI: `--color-policy {preserve_rgb, web_srgb}`, `--web-srgb`, `--linear-light`, `--strip-personal-data` (алиас `--strip-personal`), `--keep-datetime`.
+  - Поддержка `color.policy`, `color.linear_light`, `metadata.strip_personal`, `metadata.keep_datetime` в схеме профилей задач (`batchresize/profiles.py`).
+  - Все новые параметры включены в `RunOptions`, `config_digest` (инвалидация кеша resume при смене цветовой политики, linear-light или политики метаданных) и `report.json`.
+  - Честный CPU fallback для GPU-маршрута при запросе `--linear-light` или CMS-конверсии.
+- `[x]` Тесты:
+  - `tests/test_color_management.py` (9 тестов): точность sRGB/linear LUT, premultiply/unpremultiply alpha, composite без темных ореолов, web_srgb vs preserve_rgb, CMYK to sRGB, отклонение битых ICC.
+  - `tests/test_metadata_sanitization.py` (5 тестов): очистка EXIF, сохранение datetime по флагу, удаление GPS/серийников, верификатор утечек.
+  - `tests/test_stage5_pipeline.py` (5 тестов): сквозной конвейер со strip-personal-data, web-srgb, linear-light на полупрозрачном PNG, инвалидация кэша resume.
+  - `tests/test_profiles.py` (28 тестов): валидация новых полей профилей задач.
+  - Полный регрессионный прогон: 282 passed, 4 skipped.
+- `[x]` CLI-smoke: проверен на `testdata/photos` с `--color-policy web_srgb --linear-light --strip-personal-data`.
+
+### Этапы 6–8 — `[ ]` не начаты
+
+`[~]` Ограничение по объёму и crop/pad (этап 6), PNG/WebP (этап 7), измеряемая оптимизация и benchmark-протокол (этап 8) — реализация не начиналась.
 
 ### Известные ограничения среды
 

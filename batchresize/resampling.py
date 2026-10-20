@@ -138,6 +138,27 @@ def separable_resample(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndar
     return np.clip(out + 0.5, 0.0, 255.0).astype(np.uint8)
 
 
+def separable_resample_float(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
+    """CPU reference 2-pass separable resampling on float32 image without uint8 clamping."""
+    src_h, src_w, channels = img.shape
+    scale_x = plan.out_w / plan.cw
+    scale_y = plan.out_h / plan.ch
+
+    idx_x, w_x = build_separable_weights(src_w, plan.out_w, scale_x, plan.x0, filter_name)
+    idx_y, w_y = build_separable_weights(src_h, plan.out_h, scale_y, plan.y0, filter_name)
+
+    inter = np.zeros((src_h, plan.out_w, channels), dtype=np.float32)
+    img_f = img.astype(np.float32)
+    for k in range(w_x.shape[1]):
+        inter += img_f[:, idx_x[:, k], :] * w_x[None, :, k, None]
+
+    out = np.zeros((plan.out_h, plan.out_w, channels), dtype=np.float32)
+    for k in range(w_y.shape[1]):
+        out += inter[idx_y[:, k], :, :] * w_y[:, k, None, None]
+
+    return out
+
+
 def resample_cpu(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
     """Resample a BGR uint8 image according to plan.
 

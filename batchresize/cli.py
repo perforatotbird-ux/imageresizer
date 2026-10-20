@@ -138,6 +138,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sharpening blur radius/sigma in pixels")
     p.add_argument("--sharpen-threshold", type=int, default=None,
                    help="sharpening tonal difference threshold 0..255")
+    p.add_argument("--color-policy", choices=["preserve_rgb", "web_srgb", "preserve", "srgb"],
+                   default="preserve_rgb",
+                   help="color management policy ('preserve_rgb' or 'web_srgb')")
+    p.add_argument("--web-srgb", action="store_true",
+                   help="convert all output to sRGB with embedded sRGB profile")
+    p.add_argument("--linear-light", action="store_true",
+                   help="perform resampling and alpha blending in linear-light space")
+    p.add_argument("--strip-personal-data", "--strip-personal",
+                   dest="strip_personal_data", action="store_true",
+                   help="strip personal metadata (GPS, serial numbers, author, comments, XMP/IPTC)")
+    p.add_argument("--keep-datetime", action="store_true",
+                   help="preserve date/time tags when stripping personal metadata")
     p.add_argument("--bg-color", default="#FFFFFF",
                    help="background for transparent images")
     p.add_argument("--no-exif", action="store_true",
@@ -328,10 +340,40 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
             is_custom = any(getattr(args, k, None) is not None for k in ("sharpen_amount", "sharpen_radius", "sharpen_threshold"))
             sharpen_cfg = SharpenConfig(enabled=True, preset="custom" if is_custom else args.sharpen,
                                         amount=amount, radius=radius, threshold=threshold)
-    elif profile is not None and getattr(profile, "sharpen", None):
+    if profile is not None and getattr(profile, "sharpen", None):
         sharpen_cfg = parse_sharpen(profile.sharpen)
     else:
         sharpen_cfg = SharpenConfig(enabled=False, preset="off")
+
+    if "web_srgb" in provided or getattr(args, "web_srgb", False):
+        color_policy = "web_srgb"
+    elif "color_policy" in provided:
+        color_policy = args.color_policy
+    elif profile is not None and getattr(profile, "color_policy", None):
+        color_policy = profile.color_policy
+    else:
+        color_policy = "preserve_rgb"
+
+    if "linear_light" in provided:
+        linear_light = args.linear_light
+    elif profile is not None:
+        linear_light = profile.linear_light
+    else:
+        linear_light = False
+
+    if "strip_personal_data" in provided or getattr(args, "strip_personal_data", False):
+        strip_personal = True
+    elif profile is not None:
+        strip_personal = profile.strip_personal_data
+    else:
+        strip_personal = False
+
+    if "keep_datetime" in provided:
+        keep_datetime = args.keep_datetime
+    elif profile is not None:
+        keep_datetime = profile.keep_datetime
+    else:
+        keep_datetime = False
 
     return RunOptions(
         input_dir=src,
@@ -363,6 +405,10 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         cancel_file=Path(os.environ["BATCHRESIZE_CANCEL_FILE"]) if os.environ.get("BATCHRESIZE_CANCEL_FILE") else None,
         variants=tuple(variants),
         sharpen=sharpen_cfg,
+        color_policy=color_policy,
+        linear_light=linear_light,
+        strip_personal_data=strip_personal,
+        keep_datetime=keep_datetime,
     )
 
 

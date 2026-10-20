@@ -129,6 +129,10 @@ class PreviewService:
                 fsync=False,
                 profile_cuda=False,
                 sharpen=params.get("sharpen"),
+                color_policy=str(params.get("color_policy", "preserve_rgb")),
+                linear_light=bool(params.get("linear_light", False)),
+                strip_personal_data=bool(params.get("strip_personal_data", False)),
+                keep_datetime=bool(params.get("keep_datetime", False)),
             )
             engine, kind = self._engine_for(
                 backend, opts.filter_name, opts.optimize_huffman)

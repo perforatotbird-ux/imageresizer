@@ -139,11 +139,12 @@ def _validate_sharpen(value) -> dict:
 
 
 def _validate_colour(value) -> dict:
-    data = _mapping(value, "color", {"policy"})
+    data = _mapping(value, "color", {"policy", "linear_light"})
     policy = data.get("policy", "preserve")
-    if policy != "preserve":
-        _fail("color.policy", "only 'preserve' is supported by this version")
-    return {"policy": policy}
+    if policy not in ("preserve", "preserve_rgb", "web_srgb"):
+        _fail("color.policy", f"only 'preserve' (or 'web_srgb' / 'preserve_rgb') is supported (got {policy!r})")
+    linear_light = _bool(data.get("linear_light", False), "color.linear_light")
+    return {"policy": policy, "linear_light": linear_light}
 
 
 def _validate_jpeg(value) -> dict:
@@ -157,9 +158,13 @@ def _validate_jpeg(value) -> dict:
 
 
 def _validate_metadata(value) -> dict:
-    data = _mapping(value, "metadata", {"exif", "icc"})
-    return {"exif": _bool(data.get("exif", True), "metadata.exif"),
-            "icc": _bool(data.get("icc", True), "metadata.icc")}
+    data = _mapping(value, "metadata", {"exif", "icc", "strip_personal", "keep_datetime"})
+    return {
+        "exif": _bool(data.get("exif", True), "metadata.exif"),
+        "icc": _bool(data.get("icc", True), "metadata.icc"),
+        "strip_personal": _bool(data.get("strip_personal", False), "metadata.strip_personal"),
+        "keep_datetime": _bool(data.get("keep_datetime", False), "metadata.keep_datetime"),
+    }
 
 
 def _validate_variants(value) -> tuple[dict, ...]:
@@ -311,6 +316,22 @@ class Profile:
     @property
     def keep_icc(self) -> bool:
         return bool(self.metadata["icc"])
+
+    @property
+    def color_policy(self) -> str:
+        return str(self.color.get("policy", "preserve_rgb"))
+
+    @property
+    def linear_light(self) -> bool:
+        return bool(self.color.get("linear_light", False))
+
+    @property
+    def strip_personal_data(self) -> bool:
+        return bool(self.metadata.get("strip_personal", False))
+
+    @property
+    def keep_datetime(self) -> bool:
+        return bool(self.metadata.get("keep_datetime", False))
 
     def to_dict(self) -> dict:
         data = {
@@ -514,7 +535,11 @@ def build_profile(name: str, *, size: dict, mode: str, allow_upscale: bool,
                   filter_name: str, quality: int, subsampling: str,
                   bg_color: str, keep_exif: bool, keep_icc: bool,
                   profile_id: str | None = None,
-                  description: str = "", variants=()) -> Profile:
+                  description: str = "", variants=(),
+                  color_policy: str = "preserve_rgb",
+                  linear_light: bool = False,
+                  strip_personal: bool = False,
+                  keep_datetime: bool = False) -> Profile:
     return parse_profile({
         "schema_version": PROFILE_SCHEMA_VERSION,
         "id": profile_id or _slug(name),
@@ -525,11 +550,13 @@ def build_profile(name: str, *, size: dict, mode: str, allow_upscale: bool,
                 "crop_position": "center"},
         "filter": filter_name,
         "sharpen": {"enabled": False, "amount": 0.0},
-        "color": {"policy": "preserve"},
+        "color": {"policy": color_policy, "linear_light": linear_light},
         "format": "jpeg",
         "jpeg": {"quality": quality, "subsampling": subsampling,
                  "bg_color": bg_color},
-        "metadata": {"exif": keep_exif, "icc": keep_icc},
+        "metadata": {"exif": keep_exif, "icc": keep_icc,
+                     "strip_personal": strip_personal,
+                     "keep_datetime": keep_datetime},
         "variants": list(variants),
     })
 
