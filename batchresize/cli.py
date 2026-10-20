@@ -178,6 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="path to the JSON report (default: <output>/report.json)")
     p.add_argument("--profile-cuda", action="store_true",
                    help="synchronize GPU stages for service profiling (changes throughput)")
+    p.add_argument("--fast-jpeg-decode", action="store_true",
+                   help="speed up large downscales using reduced DCT JPEG decoding on CPU")
     p.add_argument("--benchmark", action="store_true",
                    help="compare GPU and CPU backends on the same files")
     p.add_argument("--benchmark-repeats", type=int, default=3,
@@ -391,6 +393,7 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
     max_file_size = args.max_file_size
     min_quality = args.min_quality
     allow_downscale_on_size_limit = args.allow_downscale_on_size_limit
+    fast_jpeg_decode = getattr(args, "fast_jpeg_decode", False)
 
     return RunOptions(
         input_dir=src,
@@ -431,6 +434,7 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         max_file_size=max_file_size,
         min_quality=min_quality,
         allow_downscale_on_size_limit=allow_downscale_on_size_limit,
+        fast_jpeg_decode=fast_jpeg_decode,
     )
 
 
@@ -550,6 +554,9 @@ def _benchmark(opts, repeats: int, quiet: bool) -> int:
         print(f"gpu unavailable for benchmark: {exc}")
     engines.append(("cpu", CpuEngine(opts.filter_name)))
 
+    from .observability import get_system_info, compute_image_metrics
+    sys_info = get_system_info()
+
     for kind, engine in engines:
         best = None
         runs = []
@@ -568,31 +575,79 @@ def _benchmark(opts, repeats: int, quiet: bool) -> int:
             if rep["benchmark_valid"] and (best is None or rep["elapsed_sec"] < best["elapsed_sec"]):
                 best = rep
         import statistics
-        results[kind] = {**(best or runs[-1]), "runs": runs,
+        warm_runs = runs[1:] if len(runs) > 1 else runs
+        results[kind] = {
+            **(best or runs[-1]),
+            "runs": runs,
+            "cold_run": runs[0],
+            "warm_runs": warm_runs,
+            "cold_time_sec": round(runs[0]["elapsed_sec"], 3),
+            "warm_median_time_sec": round(statistics.median(r["elapsed_sec"] for r in warm_runs), 3),
+            "warm_min_time_sec": round(min(r["elapsed_sec"] for r in warm_runs), 3),
             "valid": all(r["benchmark_valid"] for r in runs),
             "median_files_per_sec": statistics.median(r["files_per_sec"] for r in runs),
             "headline_selection": "best valid run; all repeats and median retained",
             "cache_state": "hash checks read all inputs outside timing; warm OS cache, not cold IO",
-            "run_root": str(run_root), "input_manifest": initial_manifest}
+            "run_root": str(run_root),
+            "input_manifest": initial_manifest,
+            "system_info": sys_info,
+        }
+
+    # Objective quality comparison between GPU and CPU outputs
+    if all(k in results and results[k]["valid"] for k in ("gpu", "cpu")):
+        import cv2
+        metrics_list = []
+        gpu_dir = run_root / "gpu_0"
+        cpu_dir = run_root / "cpu_0"
+        for p in files:
+            rel = p.relative_to(opts.input_dir).with_suffix(".jpg")
+            g_file = gpu_dir / rel
+            c_file = cpu_dir / rel
+            if g_file.exists() and c_file.exists():
+                try:
+                    img_g = cv2.imread(str(g_file))
+                    img_c = cv2.imread(str(c_file))
+                    if img_g is not None and img_c is not None and img_g.shape == img_c.shape:
+                        metrics_list.append(compute_image_metrics(img_c, img_g))
+                except Exception:
+                    pass
+        if metrics_list:
+            psnrs = [m["psnr_db"] for m in metrics_list if m["psnr_db"] < 900.0]
+            avg_psnr = round(sum(psnrs) / len(psnrs), 2) if psnrs else 999.0
+            avg_mae = round(sum(m["mae"] for m in metrics_list) / len(metrics_list), 4)
+            avg_mse = round(sum(m["mse"] for m in metrics_list) / len(metrics_list), 4)
+            results["quality_comparison"] = {
+                "psnr_db_mean": avg_psnr,
+                "mae_mean": avg_mae,
+                "mse_mean": avg_mse,
+                "sample_count": len(metrics_list),
+            }
 
     print()
-    print("=" * 68)
+    print("=" * 72)
     print(f"Benchmark ({opts.max_w}x{opts.max_h}, q={opts.quality})")
-    print("=" * 68)
-    print(f"{'backend':<8}{'file/s':>10}{'time, s':>12}{'MiB/s in':>12}")
+    print("=" * 72)
+    print(f"{'backend':<8}{'cold, s':>10}{'warm, s':>10}{'file/s':>10}{'time, s':>10}{'MiB/s in':>12}")
     for kind, rep in results.items():
-        print(f"{kind:<8}{rep['files_per_sec']:>10.1f}"
-              f"{rep['elapsed_sec']:>12.2f}{rep['mb_per_sec_in']:>12.1f}")
+        if not isinstance(rep, dict) or "files_per_sec" not in rep:
+            continue
+        cold_s = rep.get("cold_time_sec", rep["elapsed_sec"])
+        warm_s = rep.get("warm_median_time_sec", rep["elapsed_sec"])
+        print(f"{kind:<8}{cold_s:>10.2f}{warm_s:>10.2f}{rep['files_per_sec']:>10.1f}"
+              f"{rep['elapsed_sec']:>10.2f}{rep['mb_per_sec_in']:>12.1f}")
     if all(k in results and results[k]["valid"] for k in ("gpu", "cpu")):
         speedup = (results["gpu"]["files_per_sec"]
                    / max(1e-9, results["cpu"]["files_per_sec"]))
         print(f"\nGPU speedup: {speedup:.2f}x")
-    print("=" * 68)
+        if "quality_comparison" in results:
+            qc = results["quality_comparison"]
+            print(f"Quality (GPU vs CPU): PSNR={qc['psnr_db_mean']} dB, MAE={qc['mae_mean']}")
+    print("=" * 72)
     path = opts.output_dir / "benchmark.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, json.dumps(results, indent=2, ensure_ascii=False).encode("utf8"))
     print(f"Raw results: {path}")
-    return 0 if all(r["valid"] for r in results.values()) else 1
+    return 0 if all(r["valid"] for r in results.values() if isinstance(r, dict) and "valid" in r) else 1
 
 
 def _tkinter_available() -> bool:

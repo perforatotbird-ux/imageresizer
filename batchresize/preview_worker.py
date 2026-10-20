@@ -138,6 +138,7 @@ class PreviewService:
                 max_file_size=params.get("max_file_size"),
                 min_quality=int(params.get("min_quality", 30)),
                 allow_downscale_on_size_limit=bool(params.get("allow_downscale_on_size_limit", False)),
+                fast_jpeg_decode=bool(params.get("fast_jpeg_decode", False)),
             )
             engine, kind = self._engine_for(
                 backend, opts.filter_name, opts.optimize_huffman)

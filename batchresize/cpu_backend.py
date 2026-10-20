@@ -30,10 +30,17 @@ class CpuEngine:
 
     # -- decode --------------------------------------------------------------
     @staticmethod
-    def decode(data: bytes) -> np.ndarray:
+    def decode(data: bytes, reduce_scale: int = 1) -> np.ndarray:
         """Decode to BGR uint8 (alpha composited later by the caller)."""
         buf = np.frombuffer(data, dtype=np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED | cv2.IMREAD_IGNORE_ORIENTATION)
+        flags = cv2.IMREAD_UNCHANGED | cv2.IMREAD_IGNORE_ORIENTATION
+        if reduce_scale == 2:
+            flags = cv2.IMREAD_REDUCED_COLOR_2 | cv2.IMREAD_IGNORE_ORIENTATION
+        elif reduce_scale == 4:
+            flags = cv2.IMREAD_REDUCED_COLOR_4 | cv2.IMREAD_IGNORE_ORIENTATION
+        elif reduce_scale >= 8:
+            flags = cv2.IMREAD_REDUCED_COLOR_8 | cv2.IMREAD_IGNORE_ORIENTATION
+        img = cv2.imdecode(buf, flags)
         if img is None:
             raise ValueError("cv2.imdecode returned None (corrupt or unsupported)")
         if img.dtype == np.uint16:

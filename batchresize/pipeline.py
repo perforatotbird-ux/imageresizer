@@ -75,6 +75,7 @@ class RunOptions:
     max_file_size: Optional[int | str] = None
     min_quality: int = 30
     allow_downscale_on_size_limit: bool = False
+    fast_jpeg_decode: bool = False
 
     def __post_init__(self):
         self.variants = tuple(self.variants)
@@ -103,6 +104,8 @@ class RunOptions:
             raise ValueError("min_quality must be an integer between 1 and 100")
         if not isinstance(self.allow_downscale_on_size_limit, bool):
             raise ValueError("allow_downscale_on_size_limit must be a boolean")
+        if not isinstance(self.fast_jpeg_decode, bool):
+            raise ValueError("fast_jpeg_decode must be a boolean")
         if self.sizing != "resolution":
             positive(self.sizing_value, "sizing value")
         positive(self.vram_budget_gb, "VRAM budget")
@@ -163,6 +166,7 @@ class Job:
     has_alpha: bool = False
     digest: str = ""
     outputs: tuple[OutputTask, ...] = ()
+    t_queued: float = 0.0
 
 
 @dataclass
@@ -198,6 +202,10 @@ class Stats:
         self.read_count = 0
         self.backend_counts = {}
         self.extra_timings = {}
+        self.fallback_reasons = {}
+        self.backend_bytes = {}
+        self.latencies = []
+        self.gpu_service_time = 0.0
         self._counted_sources: set[Path] = set()
 
     def error(self, path: Path, exc: BaseException, count: int = 1) -> None:
@@ -205,6 +213,15 @@ class Stats:
             self.failed += count
             if len(self.errors) < 50:
                 self.errors.append((str(path), f"{type(exc).__name__}: {exc}"))
+
+    def record_fallback(self, reason: str) -> None:
+        with self.lock:
+            self.fallback += 1
+            # Clean and bound fallback reason key
+            key = str(reason).strip()
+            if len(key) > 120:
+                key = key[:117] + "..."
+            self.fallback_reasons[key] = self.fallback_reasons.get(key, 0) + 1
 
     def add_read(self, seconds: float) -> None:
         with self.lock:
@@ -222,6 +239,18 @@ class Stats:
                 self._counted_sources.add(res.job.src)
                 self.bytes_in += len(res.job.data)
             self.bytes_out += len(res.jpeg)
+
+            b_stat = self.backend_bytes.setdefault(res.backend, {"bytes_in": 0, "bytes_out": 0})
+            b_stat["bytes_out"] += len(res.jpeg)
+            if res.job.src not in self._counted_sources:
+                b_stat["bytes_in"] += len(res.job.data)
+
+            if getattr(res.job, "t_queued", 0.0) > 0.0:
+                latency_ms = (time.perf_counter() - res.job.t_queued) * 1000.0
+                if len(self.latencies) < 10000:
+                    self.latencies.append(latency_ms)
+
+            self.gpu_service_time += res.timings.get("gpu_service", 0.0)
             self.t_decode += res.timings.get("decode", 0.0)
             self.t_resize += res.timings.get("resize", 0.0)
             self.t_encode += res.timings.get("encode", 0.0)
@@ -233,6 +262,10 @@ class Stats:
                 "read_count": self.read_count,
                 "backend_counts": dict(self.backend_counts),
                 "extra_timings": dict(self.extra_timings),
+                "fallback_reasons": dict(self.fallback_reasons),
+                "backend_bytes": {k: dict(v) for k, v in self.backend_bytes.items()},
+                "latencies": list(self.latencies),
+                "gpu_service_time": self.gpu_service_time,
                 "processed": self.processed,
                 "failed": self.failed,
                 "skipped": self.skipped,
@@ -611,7 +644,8 @@ class Pipeline:
                             None, targets[None], plan, self.opts.quality,
                             self.opts.subsampling, self._resume.fingerprint))
                     job = Job(src, tasks[0].out, data, meta, tasks[0].plan,
-                              meta.has_alpha, digest, tuple(tasks))
+                              meta.has_alpha, digest, tuple(tasks),
+                              t_queued=time.perf_counter())
                     if not self.opts.overwrite:
                         remaining_tasks = []
                         for task in tasks:
@@ -819,6 +853,22 @@ class Pipeline:
                 or (job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"))
                 or job.meta.mode not in ("RGB", "RGBA")
             )
+            tasks = self._job_tasks(job)
+            reduce_scale = 1
+            if not needs_cms and getattr(self.opts, "fast_jpeg_decode", False) and job.data.startswith(b"\xFF\xD8"):
+                scales = [
+                    max(t.plan.target_w / float(job.meta.display_width),
+                        t.plan.target_h / float(job.meta.display_height))
+                    for t in tasks
+                ]
+                max_s = max(scales) if scales else 1.0
+                if max_s <= 0.125:
+                    reduce_scale = 8
+                elif max_s <= 0.25:
+                    reduce_scale = 4
+                elif max_s <= 0.50:
+                    reduce_scale = 2
+
             if needs_cms:
                 img_rgb, has_alpha, _ = decode_and_manage_color(
                     job.data, self.opts.color_policy, self.opts.keep_icc
@@ -829,7 +879,14 @@ class Pipeline:
                     img = img_rgb[:, :, ::-1]
                 img = np.ascontiguousarray(img)
             else:
-                img = engine.decode(job.data)
+                if reduce_scale > 1:
+                    try:
+                        img = engine.decode(job.data, reduce_scale=reduce_scale)
+                    except TypeError:
+                        reduce_scale = 1
+                        img = engine.decode(job.data)
+                else:
+                    img = engine.decode(job.data)
                 has_alpha = False
             t1 = time.perf_counter()
 
@@ -841,11 +898,15 @@ class Pipeline:
                 img = engine.apply_orientation(img, job.meta.orientation)
 
             t2 = time.perf_counter()
-            tasks = self._job_tasks(job)
             count = max(1, len(tasks))
             for task in tasks:
                 try:
                     t3 = time.perf_counter()
+                    exec_plan = task.plan
+                    if reduce_scale > 1:
+                        from .geometry import scale_plan_for_reduced_decode
+                        exec_plan = scale_plan_for_reduced_decode(task.plan, reduce_scale)
+
                     if self.opts.linear_light:
                         bgr = img[:, :, :3]
                         rgb = bgr[:, :, ::-1]
@@ -855,7 +916,7 @@ class Pipeline:
                             rgba_lin = np.concatenate([rgb_lin, alpha], axis=2)
                             rgba_premul = premultiply_alpha(rgba_lin)
                             res_premul = separable_resample_float(
-                                rgba_premul, task.plan, self.opts.filter_name
+                                rgba_premul, exec_plan, self.opts.filter_name
                             )
                             comp_lin = composite_linear_bg(
                                 res_premul, self.opts.bg_color, is_premultiplied=True
@@ -864,12 +925,12 @@ class Pipeline:
                             small = small_rgb[:, :, ::-1]
                         else:
                             res_lin = separable_resample_float(
-                                rgb_lin, task.plan, self.opts.filter_name
+                                rgb_lin, exec_plan, self.opts.filter_name
                             )
                             small_rgb = linear_to_srgb(res_lin)
                             small = small_rgb[:, :, ::-1]
                     else:
-                        small = engine.resize(img, task.plan)
+                        small = engine.resize(img, exec_plan)
 
                     if self.opts.sharpen.enabled:
                         from .sharpen import apply_sharpen
@@ -1145,8 +1206,7 @@ class Pipeline:
                 return
             if len(self._warnings) < 50:
                 self._warnings.append(f"{job.src}: GPU rejected file; full CPU fallback: {exc}")
-        with self.stats.lock:
-            self.stats.fallback += 1
+        self.stats.record_fallback(str(exc))
         try:
             with self._working(job):
                 self._process_cpu_one(job, CpuEngine(self.opts.filter_name), "cpu-fallback")
@@ -1261,7 +1321,8 @@ class Pipeline:
             "subsampling", "sizing", "sizing_value", "allow_upscale", "filter_name",
             "bg_color", "keep_exif", "keep_icc", "optimize_huffman",
             "color_policy", "linear_light", "strip_personal_data", "keep_datetime",
-            "crop_anchor", "crop_focus", "max_file_size", "min_quality", "allow_downscale_on_size_limit")}
+            "crop_anchor", "crop_focus", "max_file_size", "min_quality", "allow_downscale_on_size_limit",
+            "fast_jpeg_decode")}
         config["sharpen"] = opts.sharpen.to_dict()
         from . import __version__
         from importlib.metadata import version, PackageNotFoundError
@@ -1402,6 +1463,7 @@ class Pipeline:
             )
         processed = snap["processed"]
         per = (lambda v: round(1000.0 * v / processed, 3)) if processed else (lambda v: 0.0)
+        from .observability import calculate_latency_stats
         return {
             "complete": not interrupted and not self.fatal.is_set() and not self._discovery_errors
                         and snap["failed"] == 0,
@@ -1410,7 +1472,20 @@ class Pipeline:
             "warnings": list(self._warnings)[:50],
             "scan_sec": self.scan_seconds,
             "backend_counts": snap["backend_counts"],
+            "requested_backend": self.backend,
+            "actual_routes": {
+                "decode": ("nvImageCodec automatic plugin" if "gpu" in snap["backend_counts"] else "OpenCV/Pillow CPU"),
+                "resize": ("CUDA separable kernel" if any(b in snap["backend_counts"] for b in ("gpu", "hybrid")) else "Pillow/CPU float"),
+                "encode": ("nvJPEG GPU" if any(b in snap["backend_counts"] for b in ("gpu", "hybrid")) else "OpenCV CPU JPEG"),
+            },
             "codec_backend": getattr(self.engine, "backend_policy", "CPU/Pillow/OpenCV"),
+            "codec_backend_attested": False,
+            "fallback_reasons": snap.get("fallback_reasons", {}),
+            "backend_bytes": snap.get("backend_bytes", {}),
+            "host_wall_time_sec": round(elapsed, 3),
+            "latency_stats_ms": calculate_latency_stats(snap.get("latencies", [])),
+            "gpu_service_time_ms": round(snap.get("gpu_service_time", 0.0), 3) if snap.get("gpu_service_time") else None,
+            "fast_jpeg_decode": getattr(self.opts, "fast_jpeg_decode", False),
             "timing_semantics": ("synchronized service wall time (profiling changes throughput)"
                 if self.opts.profile_cuda else "host service envelopes; GPU launches asynchronous, not kernel execution time"),
             "input_validation": "decoder acceptance + JPEG marker check; not an entropy integrity certificate",

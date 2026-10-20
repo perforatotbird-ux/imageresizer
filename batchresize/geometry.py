@@ -306,3 +306,24 @@ def compute_box(src_w: int, src_h: int, sizing: str, max_w: int, max_h: int,
     box_h = max(1, int(round(src_h * scale)))
     dimensions(box_w, box_h)
     return box_w, box_h
+
+
+def scale_plan_for_reduced_decode(plan: Plan, reduce_scale: int) -> Plan:
+    """Scale a Plan when the source image was decoded with reduced DCT scale."""
+    if reduce_scale <= 1:
+        return plan
+    scale = float(reduce_scale)
+    return Plan(
+        src_w=max(1, int(round(plan.src_w / scale))),
+        src_h=max(1, int(round(plan.src_h / scale))),
+        out_w=plan.out_w,
+        out_h=plan.out_h,
+        x0=plan.x0 / scale,
+        y0=plan.y0 / scale,
+        cw=plan.cw / scale,
+        ch=plan.ch / scale,
+        canvas_w=plan.canvas_w,
+        canvas_h=plan.canvas_h,
+        pad_left=plan.pad_left,
+        pad_top=plan.pad_top,
+    )

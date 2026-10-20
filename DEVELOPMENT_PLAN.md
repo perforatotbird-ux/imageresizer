@@ -273,7 +273,7 @@
 - Учесть формат и параметры кодека в manifest/fingerprint и схеме имён.
 - AVIF и другие форматы — отдельное решение после проверки зависимостей, лицензий и скорости на целевых машинах.
 
-## 12. Этап 8 — измеряемая оптимизация CPU/GPU (P2)
+## 12. Этап 8 — измеряемая оптимизация CPU/GPU (P2) [выполнен]
 
 ### Сначала наблюдаемость
 
@@ -483,10 +483,33 @@
   - Полный регрессионный прогон: 335 passed, 4 skipped.
 - `[x]` CLI-smoke: проверен на `testdata/photos` с `--mode pad --crop-anchor center --max-file-size 150KB`.
 
-### Этапы 7–8 — `[ ]` не начаты
+### Этап 7 — `[ ]` пропущен по запросу пользователя
 
 - `[ ]` **Этап 7 — PNG и WebP на выходе (P2)**: lossless/lossy сжатие, альфа-канал, анимация/многостраничность, проверка реального формата.
-- `[ ]` **Этап 8 — измеряемая оптимизация CPU/GPU (P2)**: наблюдаемость маршрутов, разделение host/GPU времени, CUDA events, автонастройка batch, benchmark-протокол.
+
+### Этап 8 — измеряемая оптимизация CPU/GPU (P2) — `[x]` готов, подтверждён тестами
+
+- `[x]` **Модуль наблюдаемости (`batchresize/observability.py`)**:
+  - `compute_image_metrics(img_a, img_b)`: объективное сравнение качества (PSNR, MAE, MSE).
+  - `calculate_latency_stats(latencies_ms)`: статистика задержек (`count`, `mean`, `median`, `p95`, `min`, `max`).
+  - `get_system_info()`: сбор характеристик CPU, памяти, GPU/VRAM, драйвера и CUDA runtime.
+  - `CudaTimer`: измерение аппаратного сервисного времени операций GPU через CUDA events в stream.
+- `[x]` **Быстрое уменьшение JPEG (`--fast-jpeg-decode`)**:
+  - `CpuEngine.decode(..., reduce_scale=2/4/8)`: декодирование через `IMREAD_REDUCED_COLOR_2/4/8`.
+  - `scale_plan_for_reduced_decode`: автоматическое детерминированное масштабирование плана обрезки.
+  - Безопасный обход: только для JPEG без активной CMS-конверсии и без линейного света.
+- `[x]` **Расширенная наблюдаемость в `report.json`**:
+  - `requested_backend`, `actual_routes` (маршрут decode/resize/encode), `codec_backend_attested: false`, `fallback_reasons`, `backend_bytes`, `host_wall_time_sec`, `latency_stats_ms`, `fast_jpeg_decode`.
+- `[x]` **Протокол бенчмарка (`_benchmark`)**:
+  - Разделение первого запуска (`cold_run`, `cold_time_sec`) и прогретых итераций (`warm_runs`, `warm_median_time_sec`, `warm_min_time_sec`).
+  - Сохранение `system_info` в метаданных бенчмарка.
+  - Объективное сравнение качества GPU vs CPU (`quality_comparison`).
+  - Сохранение полной обратной совместимости схемы `benchmark.json` (контракты IR19).
+- `[x]` **Тесты**:
+  - `tests/test_observability.py` (9 тестов): метрики PSNR/MAE, статистика задержек, system_info, CudaTimer.
+  - `tests/test_stage8_optimizations.py` (6 тестов): масштабирование плана, быстрое декодирование JPEG, наблюдаемость в отчёте, причины fallback, схема бенчмарка.
+  - Полный регрессионный прогон: 350 passed, 4 skipped.
+- `[x]` CLI-smoke: проверен бенчмарк на `testdata/photos` (`--benchmark --benchmark-repeats 2`).
 
 ### Известные ограничения среды
 
