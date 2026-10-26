@@ -7,7 +7,7 @@ Final measured state after the performance changes.
 - Corpus: 517 real JPEGs, 688 MiB, mostly 22 MP
 - Environment: Xeon E5-2670 v3 (24 threads), 15.8 GiB RAM, GTX 1060 6 GB,
   Windows 10 19045, Python 3.13.14
-- Tests: **389 passed, 5 skipped**
+- Tests: **391 passed, 5 skipped**
 
 ## 1. Headline
 
@@ -199,7 +199,7 @@ machine.
 
 The old performance text in `REPORT.md` (46-62 files/s, 1.8-2.2x) was measured
 on small synthetic images and does not describe this corpus. `README.md`'s
-test count now matches at 389 / 5, but throughput claims should always name
+test count now matches at 391 / 5, but throughput claims should always name
 corpus, resolution, backend and cache state.
 
 The original correctness findings AUD-001, AUD-002 and AUD-003 are outside

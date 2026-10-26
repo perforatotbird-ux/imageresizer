@@ -30,6 +30,7 @@ from PIL import Image, ImageOps
 from .source_quality import QUALITY_SOURCE, SUBSAMPLING_SOURCE
 
 MAX_PREVIEW_PIXELS = 12_000_000
+MAX_ZOOM_PREVIEW_PIXELS = 24_000_000
 MAX_CACHE_BYTES = 64 * 2**20
 PROTOCOL = sys.stdout
 
@@ -54,6 +55,21 @@ def _actual_size(width: int, height: int) -> tuple[int, int, bool]:
         return width, height, False
     scale = (MAX_PREVIEW_PIXELS / pixels) ** 0.5
     return max(1, round(width * scale)), max(1, round(height * scale)), True
+
+
+def _zoom_size(width: int, height: int, zoom: float,
+               max_pixels: int = MAX_ZOOM_PREVIEW_PIXELS) -> tuple[int, int, bool]:
+    """Scale to an explicit zoom, then cap the preview at max_pixels."""
+    factor = max(0.01, float(zoom))
+    w = max(1, round(width * factor))
+    h = max(1, round(height * factor))
+    approximate = False
+    if w * h > max_pixels:
+        factor = (max_pixels / float(w * h)) ** 0.5
+        w = max(1, round(w * factor))
+        h = max(1, round(h * factor))
+        approximate = True
+    return w, h, approximate
 
 
 class PreviewService:
@@ -224,7 +240,14 @@ class PreviewService:
         with Image.open(source) as original_file:
             original = ImageOps.exif_transpose(original_file).convert("RGB")
             source_w, source_h = original.size
-            if view == "actual":
+            if view == "zoom":
+                zoom = float(req.get("zoom", 1.0))
+                max_pixels = int(req.get("max_pixels", MAX_ZOOM_PREVIEW_PIXELS))
+                max_pixels = max(1, min(max_pixels, 48_000_000))
+                ow, oh, oa = _zoom_size(source_w, source_h, zoom, max_pixels)
+                rw, rh, ra = _zoom_size(result_w, result_h, zoom, max_pixels)
+                approximate = oa or ra
+            elif view == "actual":
                 ow, oh, oa = _actual_size(source_w, source_h)
                 rw, rh, ra = _actual_size(result_w, result_h)
                 approximate = oa or ra

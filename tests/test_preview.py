@@ -112,6 +112,30 @@ def test_preview_honours_exif_orientation(worker, tmp_path):
     assert (response["original"]["w"], response["original"]["h"]) == (142, 190)
 
 
+def test_preview_zoom_view_returns_scaled_images(worker, tmp_path):
+    source = tmp_path / "zoom.jpg"
+    save_jpeg(source, make_rgb(900, 600, 11))
+    payload = request(source, 1)
+    payload.update(view="zoom", zoom=0.5, max_pixels=24_000_000)
+    response = worker.ask(payload)
+    assert response["ok"], response
+    assert response["view"] == "zoom"
+    assert (response["original"]["w"], response["original"]["h"]) == (450, 300)
+    assert response["result"]["w"] == 160
+    assert response["approximate"] is False
+
+
+def test_preview_zoom_view_caps_large_previews(worker, tmp_path):
+    source = tmp_path / "zoom-cap.jpg"
+    save_jpeg(source, make_rgb(900, 600, 12))
+    payload = request(source, 1)
+    payload.update(view="zoom", zoom=4.0, max_pixels=1_000_000)
+    response = worker.ask(payload)
+    assert response["ok"], response
+    assert response["approximate"] is True
+    assert response["original"]["w"] * response["original"]["h"] <= 1_000_000
+
+
 def test_preview_reuses_result_when_only_display_box_changes(worker, tmp_path):
     source = tmp_path / "cache.jpg"
     save_jpeg(source, make_rgb(500, 400, 9))

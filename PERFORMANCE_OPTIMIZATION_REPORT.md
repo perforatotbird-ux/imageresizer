@@ -5,7 +5,7 @@ correctness checks.
 
 - Date: 2026-10-26
 - Branch: `feature/mvp-0-3`, base commit `b4fc6b6`
-- Full suite after the final change: **389 passed, 5 skipped**
+- Full suite after the final change: **391 passed, 5 skipped**
 - Reference corpus: 517 JPEGs, 688 MiB, mostly 22 MP
 
 ## 1. Summary
@@ -289,7 +289,7 @@ for a single image or a small batch it is the dominant avoidable cost.
 Final full suite:
 
 ```
-389 passed, 5 skipped in 58.04s
+391 passed, 5 skipped in 61.24s
 ```
 
 Skips: three GUI modules because Tkinter is absent from `.venv`, one symlink

@@ -93,6 +93,71 @@ def test_preview_modes_and_view_buttons(app, tmp_path):
     assert app.view.preview_actual_button.instate(["!disabled"])
 
 
+def wait_for_large_result(app, result_w, timeout=90):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.update()
+        window = app._large_preview
+        if (window is not None and window._data is not None
+                and int(window._data.get("result_w", 0)) == result_w):
+            app.update()
+            return window
+        time.sleep(0.02)
+    pytest.fail(f"large preview did not reach result width {result_w}")
+
+
+def wait_for_large(app, timeout=90):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.update()
+        window = app._large_preview
+        if window is not None and window.status_var.get().startswith("Готово"):
+            app.update()
+            return window
+        time.sleep(0.02)
+    pytest.fail("large preview did not become ready")
+
+
+def test_large_preview_zooms_both_panes(app, tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "large.png"
+    Image.new("RGB", (800, 600), (40, 100, 160)).save(source)
+    app.input_var.set(str(tmp_path))
+    app.output_var.set(str(tmp_path / "out"))
+    app.backend_var.set("cpu")
+    app.preview_source_var.set(str(source))
+    wait_for_preview(app)
+
+    app._open_large_preview()
+    window = wait_for_large(app)
+    assert set(window._images) == {"original", "result"}
+    assert window._data["source_w"] == 800
+
+    window.actual()
+    window = wait_for_large(app)
+    assert window._zoom == 1.0
+    assert (window._images["original"].width(),
+            window._images["original"].height()) == (800, 600)
+
+    window.zoom_by(-1)
+    window = wait_for_large(app)
+    assert window._zoom == 0.75
+    assert (window._images["original"].width(),
+            window._images["original"].height()) == (600, 450)
+
+    window.fit()
+    wait_for_large(app)
+    app.width_var.set("400")
+    app.height_var.set("300")
+    window = wait_for_large_result(app, 400)
+    assert (window._images["result"].width(),
+            window._images["result"].height()) == (400, 300)
+
+    window.close()
+    assert app._large_preview is None
+
+
 def test_preview_close_stops_worker_and_removes_temp(app, tmp_path):
     from PIL import Image
 

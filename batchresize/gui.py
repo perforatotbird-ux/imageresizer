@@ -176,6 +176,7 @@ class BatchResizeUI(tk.Tk):
         self._preview_after = None
         self._preview_suspended = False
         self._preview_has_result = False
+        self._large_preview = None
 
         self._load_profile_store()
         self._build()
@@ -567,11 +568,27 @@ class BatchResizeUI(tk.Tk):
         self.preview_view_var.trace_add("write", self._schedule_preview)
         for var in (self.width_var, self.height_var, self.sizing_var,
                     self.sizing_value_var, self.mode_var, self.allow_upscale_var,
-                    self.filter_var, self.jpeg_quality_var, self.subsampling_var,
-                    self.bg_color_var, self.backend_var, self.vram_var,
-                    self.exif_var, self.icc_var, self.truncated_var,
-                    self.fallback_var, self.huffman_var):
+                    self.filter_var, self.quality_var, self.jpeg_quality_var,
+                    self.subsampling_var, self.bg_color_var, self.backend_var,
+                    self.vram_var, self.exif_var, self.icc_var, self.truncated_var,
+                    self.fallback_var, self.huffman_var, self.sharpen_preset_var,
+                    self.linear_light_var, self.web_srgb_var, self.crop_anchor_var,
+                    self.max_file_size_var, self.min_quality_var,
+                    self.allow_downscale_var):
             var.trace_add("write", self._schedule_preview)
+
+    def _open_large_preview(self) -> None:
+        window = self._large_preview
+        if window is not None:
+            try:
+                if window.win.winfo_exists():
+                    window.show()
+                    return
+            except tk.TclError:
+                pass
+            self._large_preview = None
+        from .large_preview import LargePreviewWindow
+        self._large_preview = LargePreviewWindow(self, PROJECT_DIR)
 
     def _choose_preview_file(self) -> None:
         initial = self.preview_source_var.get().strip()
@@ -594,6 +611,7 @@ class BatchResizeUI(tk.Tk):
         if self.preview_mode_var.get() == "\u0414\u043e / \u043f\u043e\u0441\u043b\u0435":
             self.preview_view_var.set("fit")
             self.view.set_preview_view("fit")
+            self._open_large_preview()
         self._schedule_preview()
 
     def _on_preview_resize(self, _event=None) -> None:
@@ -612,10 +630,14 @@ class BatchResizeUI(tk.Tk):
         source = self.preview_source_var.get().strip()
         if not source:
             self._clear_preview()
+            if self._large_preview is not None:
+                self._large_preview.schedule()
             return
         if self._preview_has_result and self.preview_status_var.get().startswith("\u0413\u043e\u0442\u043e\u0432\u043e"):
             self.preview_status_var.set("\u041f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u044b \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u044b \u2014 \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u043c \u043f\u0440\u0435\u0432\u044c\u044e\u2026")
         self._preview_after = self.after(320, self._request_preview)
+        if self._large_preview is not None:
+            self._large_preview.schedule()
 
     def _preview_box(self) -> tuple[int, int]:
         canvas = self.view.preview_canvas
@@ -666,6 +688,7 @@ class BatchResizeUI(tk.Tk):
             "sharpen": self.sharpen_preset_var.get().split(" ")[0].strip(),
             "linear_light": bool(self.linear_light_var.get()),
             "web_srgb": bool(self.web_srgb_var.get()),
+            "color_policy": "web_srgb" if self.web_srgb_var.get() else "preserve_rgb",
             "quality": QUALITY_SOURCE if source_mode else quality,
             "source_fallback_quality": quality,
             "subsampling": subsampling,
@@ -683,6 +706,7 @@ class BatchResizeUI(tk.Tk):
             "backend": self.backend_var.get(),
             "max_file_size": max_bytes,
             "min_quality": min_quality,
+            "allow_downscale_on_size_limit": bool(self.allow_downscale_var.get()),
         }
 
     def _request_preview(self) -> None:
@@ -764,10 +788,14 @@ class BatchResizeUI(tk.Tk):
             self._preview_after = None
         if self._preview_client is not None:
             self._preview_client.cancel()
+        if self._large_preview is not None:
+            self._large_preview.pause()
         self.preview_status_var.set("\u041f\u0440\u0435\u0432\u044c\u044e \u043f\u0440\u0438\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e \u0432\u043e \u0432\u0440\u0435\u043c\u044f \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0438")
 
     def _resume_preview(self) -> None:
         self._preview_suspended = False
+        if self._large_preview is not None:
+            self._large_preview.resume()
         if self.preview_source_var.get().strip():
             self._schedule_preview()
 
@@ -778,6 +806,9 @@ class BatchResizeUI(tk.Tk):
             except tk.TclError:
                 pass
             self._preview_after = None
+        large, self._large_preview = self._large_preview, None
+        if large is not None:
+            large.close()
         client, self._preview_client = self._preview_client, None
         if client is not None:
             client.close()
@@ -1376,6 +1407,8 @@ class BatchResizeUI(tk.Tk):
                     self.recursive_note.set(str(payload))
                 elif kind == "preview":
                     self._handle_preview(dict(payload))
+                elif kind == "preview-large" and self._large_preview is not None:
+                    self._large_preview.handle_event(dict(payload))
                 elif kind == "exit":
                     self._handle_exit(int(payload))
         except queue.Empty:

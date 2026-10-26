@@ -428,6 +428,7 @@ class ModernView:
         self.preview_canvas.bind('<Configure>',self._preview_resized)
         self.preview_canvas.bind('<ButtonPress-1>',lambda e:self.preview_canvas.scan_mark(e.x,e.y))
         self.preview_canvas.bind('<B1-Motion>',lambda e:self.preview_canvas.scan_dragto(e.x,e.y,gain=1))
+        self.preview_canvas.bind('<Double-Button-1>',lambda e:a._open_large_preview())
         self.clear_preview()
         self.preview_choose=self.control(ttk.Button(body,text='Выбрать изображение…',command=a._choose_preview_file))
         self.preview_choose.pack(fill='x',pady=(0,8))
@@ -441,6 +442,8 @@ class ModernView:
         self.preview_fit_button.pack(side='left')
         self.preview_actual_button=self.control(ttk.Button(view_row,text='100%',command=lambda:a._set_preview_view('actual')))
         self.preview_actual_button.pack(side='left',padx=(6,0))
+        self.preview_large_button=self.control(ttk.Button(view_row,text='\u0411\u043e\u043b\u044c\u0448\u043e\u0435 \u043e\u043a\u043d\u043e',command=a._open_large_preview))
+        self.preview_large_button.pack(side='right')
         ttk.Label(body,textvariable=a.preview_status_var,style='Muted.TLabel',
             font=('Segoe UI',9),wraplength=276).pack(anchor='w',pady=(0,4))
         ttk.Label(body,textvariable=a.preview_info_var,font=('Segoe UI',9,'bold'),

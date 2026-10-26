@@ -37,7 +37,7 @@ On the full 517-file corpus, one pass at `web_1024`:
 - GPU: 51.3 s elapsed, 10.08 files/s, 0 failures, 517 valid JPEGs
 - Wall time: 49.1 s CPU, 57.2 s GPU (GPU startup is ~5.9 s)
 
-All 389 tests pass with 5 environment skips. Output quality remains within
+All 391 tests pass with 5 environment skips. Output quality remains within
 39-48 dB PSNR of the previous engine for normal contain/cover resizes; gray
 and alpha cases are pixel-identical.
 
@@ -79,7 +79,7 @@ Method:
   lossless source.
 - 517-file runs validated every output with Pillow `verify()` and checked
   dimensions.
-- Full suite run after the changes: `389 passed, 5 skipped`.
+- Full suite run after the changes: `391 passed, 5 skipped`.
 
 ## 4. Where the time went
 
@@ -167,7 +167,7 @@ performance:
 
 ## 6. Correctness and safety
 
-- Full suite: 389 passed, 5 skipped. The skips are 3 missing Tkinter, 1
+- Full suite: 391 passed, 5 skipped. The skips are 3 missing Tkinter, 1
   symlink privilege, 1 missing CMYK ICC fixture.
 - All 517 CPU outputs and all 517 GPU outputs decode and have the expected
   683x1024 or 1024x683 dimensions.
