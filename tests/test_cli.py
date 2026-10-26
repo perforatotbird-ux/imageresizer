@@ -87,3 +87,76 @@ def test_parser_defaults():
     assert args.subsampling == "auto"
     assert args.workers >= 1
     assert args.batch_size >= 1
+
+
+def test_cli_working_budget_override():
+    from batchresize.cli import _make_options
+    args = build_parser().parse_args(["--working-mb", "512"])
+    opts = _make_options(args, Path("input"), Path("output"))
+    assert opts.max_working_bytes == 512 * 2**20
+
+
+def test_cli_sharpen_enabled_without_profile():
+    from batchresize.cli import _make_options
+    args = build_parser().parse_args(["--sharpen", "standard"])
+    opts = _make_options(args, Path("input"), Path("output"))
+    assert opts.sharpen.enabled is True
+    assert opts.sharpen.preset == "standard"
+
+
+def test_cli_low_jpeg_quality_does_not_crash_validation():
+    from batchresize.cli import _make_options
+    args = build_parser().parse_args(["--jpeg-quality", "20"])
+    opts = _make_options(args, Path("input"), Path("output"))
+    assert opts.quality == 20
+    assert opts.min_quality <= 20
+
+
+def test_cli_custom_size_with_sizing_percent():
+    from batchresize.cli import _make_options
+    args = build_parser().parse_args(["--size", "custom", "--sizing", "percent", "--sizing-value", "50"])
+    opts = _make_options(args, Path("input"), Path("output"))
+    assert opts.sizing == "percent"
+    assert opts.sizing_value == 50.0
+
+
+def test_cli_concurrency_arguments_explicit():
+    from batchresize.cli import _make_options
+    args = build_parser().parse_args(["--workers", "8", "--processors", "16", "--readers", "4", "--writers", "2"])
+    opts = _make_options(args, Path("input"), Path("output"))
+    assert opts.workers == 8
+    assert opts.processors == 16
+    assert opts.readers == 4
+    assert opts.writers == 2
+
+
+def test_pipeline_thread_allocation():
+    from batchresize.cli import _make_options
+    from batchresize.pipeline import Pipeline
+    args_default = build_parser().parse_args(["--workers", "8"])
+    opts_default = _make_options(args_default, Path("input"), Path("output"))
+
+    # CPU default
+    p_cpu = Pipeline(opts_default, None, "cpu", progress=False, files=[])
+    assert p_cpu._n_readers == 8
+    assert p_cpu._n_processors == 8
+    assert p_cpu._n_writers == 4
+
+    # GPU default
+    p_gpu = Pipeline(opts_default, None, "gpu", progress=False, files=[])
+    assert p_gpu._n_readers == 8
+    assert p_gpu._n_processors == 1
+    assert p_gpu._n_writers == 4
+
+    # Explicit override
+    args_custom = build_parser().parse_args(["--workers", "8", "--processors", "12", "--readers", "6", "--writers", "3"])
+    opts_custom = _make_options(args_custom, Path("input"), Path("output"))
+    p_custom_cpu = Pipeline(opts_custom, None, "cpu", progress=False, files=[])
+    assert p_custom_cpu._n_readers == 6
+    assert p_custom_cpu._n_processors == 12
+    assert p_custom_cpu._n_writers == 3
+
+    p_custom_gpu = Pipeline(opts_custom, None, "gpu", progress=False, files=[])
+    assert p_custom_gpu._n_readers == 6
+    assert p_custom_gpu._n_processors == 12
+    assert p_custom_gpu._n_writers == 3

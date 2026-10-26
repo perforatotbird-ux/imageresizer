@@ -42,7 +42,13 @@ def test_IR01_unsafe_roots_rejected(tmp_path, relation):
 
 def test_IR01_output_links_rejected(tmp_path):
     s=source(tmp_path); (s/'sub').mkdir(); (s/'sub/a.jpg').write_bytes(png())
-    o=tmp_path/'out';o.mkdir();(o/'sub').symlink_to(s/'sub',target_is_directory=True)
+    o=tmp_path/'out';o.mkdir()
+    try:
+        (o/'sub').symlink_to(s/'sub',target_is_directory=True)
+    except OSError as e:
+        if getattr(e, 'winerror', None) == 1314:
+            pytest.skip('WinError 1314 symlink privilege')
+        raise
     with pytest.raises(ValueError):run(s,o)
 
 def test_IR01_hardlinked_output_rejected(tmp_path):
@@ -260,6 +266,74 @@ def test_resume_lock_and_exclusive_publication(tmp_path):
     with pytest.raises(FileExistsError):atomic_write(p,b'new',overwrite=False)
     assert p.read_bytes()==b'old' and not list(o.glob('*.tmp'))
 
+# --- AUD-002: a lock left behind by a dead run must not block the folder ----
+from batchresize.safety import (LOCK_NAME, _pid_alive, clear_stale_lock,
+                                lock_is_live, _read_lock, _lock_payload)
+
+def _write_lock(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload) if isinstance(payload, dict) else str(payload))
+
+def test_stale_lock_with_dead_pid_is_taken_over(tmp_path):
+    o=tmp_path/'out'; o.mkdir()
+    _write_lock(o/LOCK_NAME, {'pid': 999999, 'token': 12345})
+    assert not lock_is_live(_read_lock(o/LOCK_NAME))
+    state=ResumeState(o,{}); state.acquire()          # must not raise
+    try:
+        assert _read_lock(o/LOCK_NAME)['pid']==os.getpid()
+    finally: state.release()
+    assert not (o/LOCK_NAME).exists()
+
+def test_stale_lock_with_reused_pid_is_taken_over(tmp_path):
+    o=tmp_path/'out'; o.mkdir()
+    # our own PID but a different process start token: PID was reused
+    _write_lock(o/LOCK_NAME, {'pid': os.getpid(), 'token': 1})
+    assert not lock_is_live(_read_lock(o/LOCK_NAME))
+    state=ResumeState(o,{}); state.acquire()
+    try:
+        assert _read_lock(o/LOCK_NAME)['pid']==os.getpid()
+    finally:
+        state.release()
+
+def test_live_lock_from_another_process_is_refused(tmp_path, monkeypatch):
+    o=tmp_path/'out'; o.mkdir()
+    payload=_lock_payload()
+    monkeypatch.setattr('batchresize.safety._lock_payload',
+                        lambda: {'pid': payload['pid'], 'token': payload['token']})
+    _write_lock(o/LOCK_NAME, {'pid': payload['pid'], 'token': payload['token']})
+    assert lock_is_live(_read_lock(o/LOCK_NAME))
+    with pytest.raises(FileExistsError):
+        ResumeState(o,{}).acquire()
+    with pytest.raises(FileExistsError):
+        clear_stale_lock(o/LOCK_NAME)
+    assert (o/LOCK_NAME).exists()
+
+def test_pid_liveness_detects_a_terminated_process(tmp_path):
+    proc=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])
+    try:
+        assert _pid_alive(proc.pid)
+    finally:
+        proc.terminate(); proc.wait(timeout=10)
+    assert not _pid_alive(proc.pid), 'OpenProcess succeeds for exited processes; the exit code must be checked'
+
+def test_clear_stale_lock_removes_only_dead_owner_locks(tmp_path):
+    o=tmp_path/'out'; o.mkdir()
+    assert clear_stale_lock(o/LOCK_NAME) is False      # nothing to do
+    _write_lock(o/LOCK_NAME, {'pid': 999999, 'token': 5})
+    assert clear_stale_lock(o/LOCK_NAME) is True
+    assert not (o/LOCK_NAME).exists()
+
+def test_cli_unlock_flag_clears_a_stale_lock(tmp_path):
+    s=source(tmp_path); o=tmp_path/'out'; o.mkdir()
+    _write_lock(o/LOCK_NAME, {'pid': 999999, 'token': 7})
+    # a stale lock is taken over automatically: the plain run now succeeds
+    assert cli.main(['-i',str(s),'-o',str(o),'--size','thumb_256','--backend','cpu'])==0
+    assert (o/'a.jpg').exists() and not (o/LOCK_NAME).exists()
+    # --unlock also clears a stale lock and reports it
+    _write_lock(o/LOCK_NAME, {'pid': 999999, 'token': 8})
+    assert cli.main(['-i',str(s),'-o',str(o),'--size','thumb_256','--backend','cpu','--unlock'])==0
+    assert not (o/LOCK_NAME).exists()
+
 def test_cancel_file_saves_manifest(tmp_path):
     s=source(tmp_path);cancel=tmp_path/'cancel';cancel.touch()
     r=run(s,tmp_path/'out',cancel_file=cancel)
@@ -338,6 +412,23 @@ def test_IR20_GPU_decode_is_synchronized_in_profile(tmp_path):
 def test_IR20_CPU_fallback_does_not_sync_broken_CUDA(tmp_path):
     class G:
         def synchronize(self):raise RuntimeError('broken CUDA must not break CPU fallback')
-    p=Pipeline(RunOptions(tmp_path,tmp_path/'out',32,32,profile_cuda=True),G(),'gpu',False)
+    p=Pipeline(RunOptions(tmp_path,tmp_path/'out',32,32,profile_cuda=True),G(),'cpu',False)
     p._gpu_fallback(job(tmp_path),RuntimeError('GPU failed'))
     assert p.results.qsize()==1 and p.stats.failed==0
+
+def test_IR27_CPU_encoder_honors_optimize_huffman():
+    """--optimize-huffman must reach the CPU encoder (it was silently ignored)."""
+    rng=np.random.default_rng(7)
+    img=rng.integers(0,255,(256,256,3),dtype=np.uint8)
+    plain=CpuEngine('lanczos3',False).encode(img,90,0)
+    optimized=CpuEngine('lanczos3',True).encode(img,90,0)
+    assert plain.startswith(b'\xff\xd8') and optimized.startswith(b'\xff\xd8')
+    assert len(optimized)<len(plain)
+
+def test_IR27_optimize_huffman_reaches_CPU_engine_from_options(tmp_path):
+    s=source(tmp_path);o=tmp_path/'out'
+    opts=RunOptions(s,o,32,32,workers=1,optimize_huffman=True)
+    engine,kind=cli._select_engine('cpu',opts)
+    assert kind=='cpu' and getattr(engine,'optimize_huffman',False) is True
+    rep=Pipeline(opts,engine,'cpu',False).run()
+    assert rep['processed']==1

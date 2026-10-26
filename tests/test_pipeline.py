@@ -296,3 +296,42 @@ def test_gpu_cpu_outputs_are_close(tmp_path, gpu_available):
     b = read_rgb(out_cpu / "p.jpg")
     assert a.shape == b.shape
     assert psnr(a, b) > 27
+
+
+def test_actual_route_flags_maps_backend_labels():
+    """AUD-001 regression: route strings must follow the recorded labels.
+
+    A run whose results were produced by the GPU engine used to be reported
+    as CPU because the derivation looked for the literal labels 'gpu'/'hybrid'
+    while ``_finish`` wrote 'nvimgcodec-auto'.
+    """
+    from batchresize.pipeline import actual_route_flags
+
+    decode, compute = actual_route_flags({"cpu": 8})
+    assert decode is False and compute is False
+
+    for label in ("gpu", "nvimgcodec-auto"):
+        decode, compute = actual_route_flags({label: 8})
+        assert decode is True and compute is True
+
+    decode, compute = actual_route_flags({"hybrid": 8})
+    assert decode is False and compute is True
+
+    decode, compute = actual_route_flags({"cpu": 3, "nvimgcodec-auto": 1})
+    assert decode is True and compute is True
+
+    assert actual_route_flags({}) == (False, False)
+
+
+def test_report_actual_routes_follow_backend(tmp_path, sample_tree, backend):
+    """The published route strings must describe what actually ran."""
+    out = tmp_path / "out"
+    code, rep = run_cli(sample_tree, out, "--size", "small_512", "--backend", backend)
+    assert code == 0
+    labels = set(rep["backend_counts"])
+    routes = rep["actual_routes"]
+    gpu_decode = bool(labels & {"gpu", "nvimgcodec-auto"})
+    gpu_compute = gpu_decode or "hybrid" in labels
+    assert (routes["decode"] == "nvImageCodec automatic plugin") == gpu_decode
+    assert (routes["resize"] == "CUDA separable kernel") == gpu_compute
+    assert (routes["encode"] == "nvJPEG GPU") == gpu_compute

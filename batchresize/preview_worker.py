@@ -27,6 +27,8 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageOps
 
+from .source_quality import QUALITY_SOURCE, SUBSAMPLING_SOURCE
+
 MAX_PREVIEW_PIXELS = 12_000_000
 MAX_CACHE_BYTES = 64 * 2**20
 PROTOCOL = sys.stdout
@@ -107,8 +109,11 @@ class PreviewService:
                 max_w=int(params["max_w"]),
                 max_h=int(params["max_h"]),
                 mode=str(params.get("mode", "contain")),
-                quality=int(params["quality"]),
-                subsampling=int(params["subsampling"]),
+                quality=(params["quality"] if params["quality"] == QUALITY_SOURCE
+                         else int(params["quality"])),
+                subsampling=(params["subsampling"]
+                             if params["subsampling"] == SUBSAMPLING_SOURCE
+                             else int(params["subsampling"])),
                 sizing=str(params.get("sizing", "resolution")),
                 sizing_value=float(params.get("sizing_value", 0.0)),
                 allow_upscale=bool(params.get("allow_upscale", False)),
@@ -137,6 +142,7 @@ class PreviewService:
                 crop_focus=params.get("crop_focus"),
                 max_file_size=params.get("max_file_size"),
                 min_quality=int(params.get("min_quality", 30)),
+                source_fallback_quality=int(params.get("source_fallback_quality", 90)),
                 allow_downscale_on_size_limit=bool(params.get("allow_downscale_on_size_limit", False)),
                 fast_jpeg_decode=bool(params.get("fast_jpeg_decode", False)),
             )

@@ -99,20 +99,28 @@ def parse_sharpen(spec: Any) -> SharpenConfig:
     raise SharpenError(f"invalid sharpen specification {spec!r}")
 
 
-def apply_sharpen(img: np.ndarray, config: SharpenConfig) -> np.ndarray:
-    """Apply Unsharp Mask on the luminance (Y) channel of a BGR uint8 image.
+def apply_sharpen(img, config: SharpenConfig):
+    """Apply Unsharp Mask on the luminance (Y) channel of a BGR/RGB uint8 image.
 
-    Returns the sharpened BGR uint8 image (or original if disabled).
+    Supports both NumPy (CPU) and CuPy (GPU) arrays.
+    Returns the sharpened image (or original if disabled).
     """
     if not config.enabled or config.amount <= 0.0 or config.radius <= 0.0:
         return img
     if cv2 is None:
         raise RuntimeError("opencv is required for output sharpening")
-    if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
-        raise ValueError("apply_sharpen requires uint8 BGR image with three channels")
 
-    # Convert to YCrCb (channel 0 is Luminance)
-    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    is_gpu = getattr(img, "__cuda_array_interface__", None) is not None
+    host_img = img.get() if is_gpu else img
+
+    if host_img.ndim != 3 or host_img.shape[2] != 3 or host_img.dtype != np.uint8:
+        raise ValueError("apply_sharpen requires uint8 image with three channels")
+
+    # If from CuPy (GPU), array is RGB; on CPU OpenCV it is BGR
+    if is_gpu:
+        ycrcb = cv2.cvtColor(host_img, cv2.COLOR_RGB2YCrCb)
+    else:
+        ycrcb = cv2.cvtColor(host_img, cv2.COLOR_BGR2YCrCb)
     y = ycrcb[:, :, 0].astype(np.float32)
 
     # Compute Gaussian blur kernel size from sigma/radius
@@ -131,4 +139,9 @@ def apply_sharpen(img: np.ndarray, config: SharpenConfig) -> np.ndarray:
 
     # Recombine with untouched chrominance channels (zero color fringing)
     ycrcb[:, :, 0] = sharp_y
-    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    if is_gpu:
+        res = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
+        import cupy as cp
+        return cp.asarray(res)
+    else:
+        return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)

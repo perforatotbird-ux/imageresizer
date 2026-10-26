@@ -7,6 +7,11 @@ from typing import Optional, Tuple
 import numpy as np
 from PIL import Image, ImageCms
 
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
+
 COLOR_POLICY_PRESERVE = "preserve_rgb"
 COLOR_POLICY_SRGB = "web_srgb"
 SUPPORTED_COLOR_POLICIES = {
@@ -59,6 +64,8 @@ def get_icc_color_space(icc_bytes: bytes) -> str:
 def srgb_to_linear(arr: np.ndarray) -> np.ndarray:
     """Convert sRGB array (uint8 or float32 [0.0..1.0]) to linear float32 [0.0..1.0]."""
     if arr.dtype == np.uint8:
+        if cv2 is not None:
+            return cv2.LUT(arr, SRGB_TO_LINEAR_LUT)
         return SRGB_TO_LINEAR_LUT[arr]
     arr_f = np.clip(arr.astype(np.float32), 0.0, 1.0)
     return np.where(

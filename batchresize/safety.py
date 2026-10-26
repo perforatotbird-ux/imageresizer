@@ -78,6 +78,119 @@ def atomic_write(path: Path, data: bytes, fsync=False, *, overwrite=True):
     finally:
         tmp.unlink(missing_ok=True)
 
+def _lock_payload() -> dict:
+    """Lock content: PID plus a token that survives PID reuse."""
+    pid = os.getpid()
+    token = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("lo", wintypes.DWORD), ("hi", wintypes.DWORD)]
+
+        creation, exit_code, kernel, user = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(_FILETIME)] * 4
+        if not k32.GetProcessTimes(k32.GetCurrentProcess(), ctypes.byref(creation),
+                                   ctypes.byref(exit_code), ctypes.byref(kernel),
+                                   ctypes.byref(user)):
+            raise OSError(ctypes.get_last_error())
+        token = (creation.hi << 32) | creation.lo
+    except Exception:
+        token = None
+    return {'pid': pid, 'token': token}
+
+
+def _read_lock(path: Path) -> Optional[dict]:
+    try:
+        text = path.read_text(encoding='utf8').strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and 'pid' in obj:
+            return {'pid': int(obj['pid']), 'token': obj.get('token')}
+    except (ValueError, TypeError):
+        pass
+    try:                                   # legacy payload: plain PID text
+        return {'pid': int(text), 'token': None}
+    except (ValueError, TypeError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                               ctypes.POINTER(wintypes.DWORD)]
+            k32.GetExitCodeProcess.restype = wintypes.BOOL
+            handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False                     # no such process any more
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                # OpenProcess succeeds for exited-but-unreaped processes, so the
+                # exit code - not the handle - decides liveness.
+                return code.value == 259         # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def lock_is_live(info: Optional[dict]) -> bool:
+    """True when the lock is genuinely held by a running instance."""
+    if not info or not isinstance(info.get('pid'), int):
+        return False
+    if not _pid_alive(info['pid']):
+        return False
+    mine = _lock_payload()
+    if info['pid'] == mine['pid']:
+        # our own live lock, or a previous incarnation that reused our PID
+        return info.get('token') == mine['token']
+    return True
+
+
+def clear_stale_lock(path: Path, *, force: bool = False) -> bool:
+    """Remove a lock left behind by a dead instance. Never touches a live one."""
+    path = Path(path)
+    try:
+        reject_links(path, path.parent)
+    except ValueError:
+        if not force:
+            raise
+    if not path.exists():
+        return False
+    if not force and lock_is_live(_read_lock(path)):
+        raise FileExistsError(
+            f'{path} is held by a running batchresize instance; stop it first')
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 class ResumeState:
     def __init__(self, root: Path, config: dict):
         self.root = root
@@ -96,10 +209,29 @@ class ResumeState:
     def acquire(self):
         self.root.mkdir(parents=True, exist_ok=True)
         reject_links(self.lock_path, self.root)
-        # Reload only while holding the exclusive run lock.
-        with self.lock_path.open('x', encoding='utf8') as f:
-            f.write(str(os.getpid()))
-        self.locked = True
+        for _ in range(3):
+            try:
+                # Reload only while holding the exclusive run lock.
+                with self.lock_path.open('x', encoding='utf8') as f:
+                    json.dump(_lock_payload(), f)
+                self.locked = True
+                break
+            except FileExistsError:
+                info = _read_lock(self.lock_path)
+                if lock_is_live(info):
+                    raise FileExistsError(
+                        f'another batchresize run is writing to {self.root} '
+                        f'({LOCK_NAME} held by pid {info["pid"]}). If that run is '
+                        f'gone, rerun with --unlock to clear the stale lock.')
+                # Stale lock from a dead instance: take it over.
+                if not clear_stale_lock(self.lock_path):
+                    raise FileExistsError(
+                        f'could not clear the stale lock {self.lock_path}; '
+                        f'inspect it or rerun with --unlock')
+        else:
+            raise FileExistsError(
+                f'output lock {self.lock_path} kept changing between runs; '
+                f'inspect it manually')
         if self.path.exists():
             obj = json.loads(self.path.read_text(encoding='utf8'))
             if obj.get('version') != 1 or not isinstance(obj.get('entries'), dict):

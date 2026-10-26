@@ -234,24 +234,35 @@ def plan_pad(src_w: int, src_h: int, target_w: int, target_h: int,
     )
 
 
-def apply_pad(img: np.ndarray, plan: Plan, bg_color: tuple[int, int, int]) -> np.ndarray:
+def apply_pad(img, plan: Plan, bg_color: tuple[int, int, int]):
     """Place resampled image onto padded canvas according to plan."""
     if not plan.is_pad:
         return img
     canvas_h, canvas_w = plan.canvas_h, plan.canvas_w
     channels = img.shape[2]
+    is_gpu = getattr(img, "__cuda_array_interface__", None) is not None
+    if is_gpu:
+        import cupy as cp
+        xp = cp
+    else:
+        xp = np
+
     if img.dtype == np.uint8:
-        # BGR uint8
-        bg = np.array([bg_color[2], bg_color[1], bg_color[0]], dtype=np.uint8)
-        out = np.empty((canvas_h, canvas_w, channels), dtype=np.uint8)
+        # If CuPy on GPU, image is RGB; on CPU (OpenCV), image is BGR:
+        is_gpu = (xp is not np)
+        if is_gpu:
+            bg = xp.array([bg_color[0], bg_color[1], bg_color[2]], dtype=xp.uint8)
+        else:
+            bg = xp.array([bg_color[2], bg_color[1], bg_color[0]], dtype=xp.uint8)
+        out = xp.empty((canvas_h, canvas_w, channels), dtype=xp.uint8)
         out[:, :] = bg
     else:
         # float32 linear
         from .color_management import SRGB_TO_LINEAR_LUT
         bg_u8 = np.array([bg_color[0], bg_color[1], bg_color[2]], dtype=np.uint8)
         bg_lin = SRGB_TO_LINEAR_LUT[bg_u8]
-        out = np.empty((canvas_h, canvas_w, channels), dtype=np.float32)
-        out[:, :] = bg_lin
+        out = xp.empty((canvas_h, canvas_w, channels), dtype=xp.float32)
+        out[:, :] = xp.asarray(bg_lin)
 
     out[plan.pad_top : plan.pad_top + plan.out_h, plan.pad_left : plan.pad_left + plan.out_w] = img
     return out

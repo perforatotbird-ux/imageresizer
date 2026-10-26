@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .source_quality import QUALITY_SOURCE
+
 # --- size presets -----------------------------------------------------------
 # Values are interpreted as the maximum width/height for `contain`
 # and as the desired target box for `cover` (smaller if upscaling is off).
@@ -96,9 +98,12 @@ class OutputSpec:
     allow_upscale: bool = False
 
     def describe(self) -> str:
-        sub = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}[self.subsampling]
+        sub = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}.get(
+            self.subsampling, "as source")
+        quality = ("as source" if self.quality == QUALITY_SOURCE
+                   else f"q={self.quality}")
         return (
-            f"{self.max_w}x{self.max_h} {self.mode}, JPEG q={self.quality}, "
+            f"{self.max_w}x{self.max_h} {self.mode}, JPEG {quality}, "
             f"chroma={sub}, upscale={'on' if self.allow_upscale else 'off'}"
         )
 
@@ -135,6 +140,9 @@ def resolve_quality(
     if quality_preset is None:
         quality_preset = "balanced"
     quality_preset = QUALITY_ALIASES.get(quality_preset, quality_preset)
+    if quality_preset == QUALITY_SOURCE:
+        from .source_quality import QUALITY_SOURCE as _SOURCE
+        return _SOURCE
     if quality_preset not in ALL_QUALITY_PRESETS:
         raise ValueError(
             f"unknown quality preset {quality_preset!r}; "

@@ -62,13 +62,18 @@ def is_truncated_jpeg(data: bytes) -> bool:
     """
     if not data.startswith(b"\xff\xd8"):
         return True
+    n = len(data)
     i = 2
     scan = False
-    while i < len(data):
+    while i < n:
         if data[i] != 255:
             if not scan:
                 return True
-            i += 1
+            # Entropy-coded data: jump to the next marker byte in C instead of
+            # walking megabytes of scan data one Python byte at a time.
+            i = data.find(b"\xff", i + 1)
+            if i < 0:
+                return True
             continue
         i += 1
         while i < len(data) and data[i] == 255:
@@ -84,11 +89,11 @@ def is_truncated_jpeg(data: bytes) -> bool:
             continue
         if i + 2 > len(data):
             return True
-        n = int.from_bytes(data[i:i+2], "big")
-        if n < 2 or i + n > len(data):
+        seg_len = int.from_bytes(data[i:i+2], "big")
+        if seg_len < 2 or i + seg_len > len(data):
             return True
         scan = scan or marker == 0xDA
-        i += n
+        i += seg_len
     return True
 
 

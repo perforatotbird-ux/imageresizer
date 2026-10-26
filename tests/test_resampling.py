@@ -9,7 +9,9 @@ from batchresize.resampling import (
     build_separable_weights,
     mitchell_kernel,
     resample_cpu,
+    resample_cpu_float,
     separable_resample,
+    separable_resample_float,
 )
 
 
@@ -47,6 +49,15 @@ class TestFilterKernels:
         # Near 2.0
         assert np.isclose(mitchell_kernel(np.array([2.0 - eps]))[0],
                           mitchell_kernel(np.array([2.0 + eps]))[0], atol=1e-5)
+
+    def test_mitchell_dc_gain_is_one(self):
+        """Guard: unit DC gain, otherwise resizing shifts image brightness.
+
+        k(0) + 2*k(1) + 2*k(2) == 1 keeps a 1:1 resample brightness-neutral.
+        The mis-transcribed form (7x^3-12x^2+5)/6 yields 0.944 (~5.6% darker).
+        """
+        k = mitchell_kernel(np.array([0.0, 1.0, 2.0]))
+        assert np.isclose(k[0] + 2.0 * k[1] + 2.0 * k[2], 1.0, atol=1e-6)
 
 
 class TestSeparableWeights:
@@ -147,6 +158,22 @@ class TestResampleCPU:
         out = resample_cpu(src, plan, "mitchell")
         assert out.shape == (40, 40, 3)
         assert np.all(out > 170)
+
+    def test_float_fast_path_stays_close_to_reference(self):
+        y, x = np.mgrid[0:192, 0:256].astype(np.float32)
+        src = np.stack([
+            x / 255.0,
+            y / 191.0,
+            (x + y) / 446.0,
+        ], axis=2).astype(np.float32)
+        plan = make_plan(256, 192, 128, 96)
+        fast = resample_cpu_float(src, plan, "lanczos3")
+        ref = separable_resample_float(src, plan, "lanczos3")
+        mse = float(np.mean((fast - ref) ** 2))
+        psnr = 10.0 * np.log10(1.0 / mse) if mse else 99.0
+        assert fast.shape == (96, 128, 3)
+        assert fast.dtype == np.float32
+        assert psnr > 35.0
 
     def test_identity_plan_returns_contiguous_copy(self):
         src = np.full((20, 20, 3), 50, dtype=np.uint8)

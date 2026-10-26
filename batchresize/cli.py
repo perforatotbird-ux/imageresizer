@@ -93,10 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sizing-value", type=float, default=0.0,
                    help="value for --sizing: percent, megapixels or pixels")
     p.add_argument("--quality", "--compress", dest="quality", default="balanced",
-                   choices=[*ALL_QUALITY_PRESETS, "custom"],
-                   help="recompression preset: light=90, medium=80, "
-                        "strong=65, extreme=50 (also compact/balanced/"
-                        "high/very_high)")
+                   choices=[*ALL_QUALITY_PRESETS, "custom", "source"],
+                   help="recompression preset. Unique values: maximum=95, "
+                        "very_high=95, high=90, light=90 (alias of high), "
+                        "balanced=80, medium=80 (alias of balanced), "
+                        "compact=65, strong=65 (alias of compact), small=60, "
+                        "extreme=50. 'source' keeps the quantisation tables of "
+                        "every source file (only the geometry changes). "
+                        "Use --jpeg-quality 1..100 for an exact value")
     p.add_argument("--jpeg-quality", type=int, default=None,
                    help="explicit JPEG quality 1..100 (overrides --quality)")
     p.add_argument("--subsampling", default="auto",
@@ -118,21 +122,37 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["auto", "gpu", "hybrid", "cpu"],
                    help="processing backend")
     p.add_argument("--workers", "--threads", dest="workers", type=int, default=8,
-                   help="number of threads: readers/processors "
-                        "(writers = max(2, workers//2))")
+                   help="default number of worker threads (readers/processors on CPU)")
+    p.add_argument("--processors", type=int, default=None,
+                   help="number of image processing threads (default: CPU=workers, GPU=1)")
+    p.add_argument("--readers", type=int, default=None,
+                   help="number of disk read threads (default: workers)")
+    p.add_argument("--writers", type=int, default=None,
+                   help="number of disk write threads (default: max(2, workers // 2))")
     p.add_argument("--batch-size", type=int, default=8,
                    help="images per GPU batch")
     p.add_argument("--queue-depth", type=int, default=32,
                    help="bounded queue size between stages")
+    p.add_argument("--working-mb", type=int, default=None,
+                   help="soft CPU working-set budget in MiB "
+                        "(default: adaptive, 25%% of RAM capped at 2048)")
     p.add_argument("--vram-budget", type=float, default=2.0,
                    help="soft application-array estimate in GiB, NOT a hard VRAM cap")
     p.add_argument("--limit", type=int, default=None,
                    help="process only the first N files")
     p.add_argument("--skip-existing", action="store_true",
-                   help="skip only outputs verified by source/config/output hashes and JPEG decode")
+                   help="skip only outputs verified by source/config/output "
+                        "hashes and JPEG decode. Unverified or outdated outputs "
+                        "are NOT overwritten and NOT skipped: they are reported "
+                        "as errors, so re-run with --overwrite to rebuild them "
+                        "after a settings change")
     p.add_argument("--overwrite", action="store_true", default=False,
                    help="overwrite existing results (default: on unless "
                         "--skip-existing is given)")
+    p.add_argument("--unlock", action="store_true",
+                   help="remove a stale .batchresize.lock left in the output "
+                        "folder by a crashed or killed run, then continue. A "
+                        "lock held by a live instance is never removed")
     p.add_argument("--allow-upscale", action="store_true",
                    help="allow enlarging small photos")
     from .resampling import SUPPORTED_FILTERS
@@ -289,7 +309,11 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
             sizing_value = profile.sizing_value
     else:
         if args.size == "custom" and (args.width is None or args.height is None):
-            raise SystemExit("error: --size custom requires --width and --height")
+            if args.sizing != "resolution":
+                args.width = args.width or 10_000
+                args.height = args.height or 10_000
+            else:
+                raise SystemExit("error: --size custom requires --width and --height")
         max_w, max_h = resolve_size(
             None if args.size == "custom" else args.size,
             args.width, args.height)
@@ -299,6 +323,9 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
     try:
         if profile is not None and not ({"quality", "jpeg_quality"} & provided):
             quality = profile.quality
+        elif args.quality == "source":
+            from .source_quality import QUALITY_SOURCE
+            quality = QUALITY_SOURCE
         else:
             quality = resolve_quality(
                 None if args.quality == "custom" else args.quality,
@@ -325,37 +352,61 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
     subsampling = {"auto": None, "444": 0, "422": 1, "420": 2}[sub_text]
     if subsampling is None:
         from .presets import auto_subsampling
+        from .source_quality import QUALITY_SOURCE, SUBSAMPLING_SOURCE
 
-        subsampling = auto_subsampling(quality)
+        if quality == QUALITY_SOURCE:
+            # "auto" follows the chroma layout of every source file.
+            subsampling = SUBSAMPLING_SOURCE
+        else:
+            subsampling = auto_subsampling(quality)
 
     if args.workers < 1:
         raise SystemExit("error: --workers must be >= 1")
+    if args.processors is not None and args.processors < 1:
+        raise SystemExit("error: --processors must be >= 1")
+    if args.readers is not None and args.readers < 1:
+        raise SystemExit("error: --readers must be >= 1")
+    if args.writers is not None and args.writers < 1:
+        raise SystemExit("error: --writers must be >= 1")
     if args.batch_size < 1:
         raise SystemExit("error: --batch-size must be >= 1")
     if args.queue_depth < 1:
         raise SystemExit("error: --queue-depth must be >= 1")
+    if args.working_mb is not None and args.working_mb < 1:
+        raise SystemExit("error: --working-mb must be >= 1")
 
     overwrite = args.overwrite or not args.skip_existing
     from .sharpen import SharpenConfig, parse_sharpen
+    if profile is not None and getattr(profile, "sharpen", None):
+        profile_sharpen = parse_sharpen(profile.sharpen)
+    else:
+        profile_sharpen = SharpenConfig(enabled=False, preset="off")
+
     has_sharpen_args = (getattr(args, "sharpen", None) is not None or
                         any(getattr(args, k, None) is not None for k in
                             ("sharpen_amount", "sharpen_radius", "sharpen_threshold")))
     if has_sharpen_args:
-        if args.sharpen in ("off", None) and not any(getattr(args, k, None) is not None for k in
-                                                     ("sharpen_amount", "sharpen_radius", "sharpen_threshold")):
+        if args.sharpen == "off":
             sharpen_cfg = SharpenConfig(enabled=False, preset="off")
-        else:
-            base = SharpenConfig.from_preset(args.sharpen if args.sharpen in ("weak", "standard") else "standard")
+        elif args.sharpen in ("weak", "standard"):
+            base = SharpenConfig.from_preset(args.sharpen)
             amount = args.sharpen_amount if getattr(args, "sharpen_amount", None) is not None else base.amount
             radius = args.sharpen_radius if getattr(args, "sharpen_radius", None) is not None else base.radius
             threshold = args.sharpen_threshold if getattr(args, "sharpen_threshold", None) is not None else base.threshold
             is_custom = any(getattr(args, k, None) is not None for k in ("sharpen_amount", "sharpen_radius", "sharpen_threshold"))
             sharpen_cfg = SharpenConfig(enabled=True, preset="custom" if is_custom else args.sharpen,
                                         amount=amount, radius=radius, threshold=threshold)
-    if profile is not None and getattr(profile, "sharpen", None):
-        sharpen_cfg = parse_sharpen(profile.sharpen)
+        elif any(getattr(args, k, None) is not None for k in ("sharpen_amount", "sharpen_radius", "sharpen_threshold")):
+            base = profile_sharpen if profile_sharpen.enabled else SharpenConfig.from_preset("standard")
+            amount = args.sharpen_amount if getattr(args, "sharpen_amount", None) is not None else base.amount
+            radius = args.sharpen_radius if getattr(args, "sharpen_radius", None) is not None else base.radius
+            threshold = args.sharpen_threshold if getattr(args, "sharpen_threshold", None) is not None else base.threshold
+            sharpen_cfg = SharpenConfig(enabled=True, preset="custom",
+                                        amount=amount, radius=radius, threshold=threshold)
+        else:
+            sharpen_cfg = SharpenConfig(enabled=False, preset="off")
     else:
-        sharpen_cfg = SharpenConfig(enabled=False, preset="off")
+        sharpen_cfg = profile_sharpen
 
     if "web_srgb" in provided or getattr(args, "web_srgb", False):
         color_policy = "web_srgb"
@@ -391,9 +442,21 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
                    else args.crop_anchor)
     crop_focus = args.crop_focus
     max_file_size = args.max_file_size
-    min_quality = args.min_quality
+    from .source_quality import QUALITY_SOURCE
+    if "min_quality" not in provided and quality != QUALITY_SOURCE:
+        min_quality = min(args.min_quality, quality)
+    else:
+        min_quality = args.min_quality
+    from .source_quality import FALLBACK_QUALITY
+    # With --quality source the JPEG quality is taken from every file; the
+    # explicit value stays the fallback for sources without JPEG tables.
+    source_fallback_quality = args.jpeg_quality or FALLBACK_QUALITY
     allow_downscale_on_size_limit = args.allow_downscale_on_size_limit
     fast_jpeg_decode = getattr(args, "fast_jpeg_decode", False)
+
+    extra = {}
+    if args.working_mb is not None:
+        extra["max_working_bytes"] = args.working_mb * 2**20
 
     return RunOptions(
         input_dir=src,
@@ -433,15 +496,21 @@ def _make_options(args, src: Path, dst: Path, profile: Profile | None = None,
         crop_focus=crop_focus,
         max_file_size=max_file_size,
         min_quality=min_quality,
+        source_fallback_quality=source_fallback_quality,
         allow_downscale_on_size_limit=allow_downscale_on_size_limit,
         fast_jpeg_decode=fast_jpeg_decode,
+        processors=args.processors,
+        readers=args.readers,
+        writers=args.writers,
+        **extra,
     )
 
 
 def _select_engine(backend: str, opts=None):
     """Return (engine, engine_kind); ``(None, "fail")`` for a hard GPU request."""
     if backend == "cpu":
-        return CpuEngine(opts.filter_name if opts else "lanczos3"), "cpu"
+        return CpuEngine(opts.filter_name if opts else "lanczos3",
+                         opts.optimize_huffman if opts else False), "cpu"
 
     try:
         engine = GpuEngine(filter_name=opts.filter_name if opts else "lanczos3",
@@ -452,7 +521,8 @@ def _select_engine(backend: str, opts=None):
     except Exception as exc:
         if backend == "auto":
             print(f"gpu unavailable ({exc}); falling back to CPU")
-            return CpuEngine(opts.filter_name if opts else "lanczos3"), "cpu"
+            return CpuEngine(opts.filter_name if opts else "lanczos3",
+                             opts.optimize_huffman if opts else False), "cpu"
         print(f"FATAL: GPU backend requested but unavailable: {exc}")
         return None, "fail"
 
@@ -552,7 +622,7 @@ def _benchmark(opts, repeats: int, quiet: bool) -> int:
         engines.append(("gpu", gpu))
     except Exception as exc:
         print(f"gpu unavailable for benchmark: {exc}")
-    engines.append(("cpu", CpuEngine(opts.filter_name)))
+    engines.append(("cpu", CpuEngine(opts.filter_name, opts.optimize_huffman)))
 
     from .observability import get_system_info, compute_image_metrics
     sys_info = get_system_info()
@@ -748,8 +818,15 @@ def _main(argv: Optional[list[str]] = None) -> int:
         raise SystemExit("error: output folder must differ from the input folder")
 
     opts = _make_options(args, src, dst, profile, provided)
-    from .safety import check_roots, reject_links, STATE_NAME, LOCK_NAME
+    from .safety import check_roots, clear_stale_lock, reject_links, STATE_NAME, LOCK_NAME
     check_roots(opts.input_dir, opts.output_dir.resolve())
+    if args.unlock:
+        # Explicit recovery for a lock left behind by a dead run. A live lock
+        # is never removed: clear_stale_lock raises instead.
+        if clear_stale_lock(opts.output_dir / LOCK_NAME):
+            print(f"unlocked      : removed a stale {LOCK_NAME} from {dst}")
+        else:
+            print(f"unlock        : no {LOCK_NAME} to remove in {dst}")
     report_path = Path(args.report).expanduser().absolute() if args.report else opts.output_dir / "report.json"
     if report_path.suffix.lower() != ".json" or report_path.name in (STATE_NAME, LOCK_NAME):
         raise ValueError("report must be a separate .json file")
@@ -774,9 +851,18 @@ def _main(argv: Optional[list[str]] = None) -> int:
         print(f"output       : {spec.describe()}")
     print(f"input        : {src}")
     print(f"output dir   : {dst}")
-    print(f"threads      : readers={opts.workers}, "
-          f"processors={opts.workers if kind == 'cpu' else 1}, "
-          f"writers={max(2, opts.workers // 2)}")
+    n_readers = opts.readers if opts.readers is not None else opts.workers
+    if opts.processors is not None:
+        n_processors = opts.processors
+    elif kind == "cpu":
+        n_processors = opts.workers
+    else:
+        n_processors = 1
+    n_writers = opts.writers if opts.writers is not None else max(2, opts.workers // 2)
+
+    print(f"threads      : readers={n_readers}, "
+          f"processors={n_processors}, "
+          f"writers={n_writers}")
 
     t0 = time.perf_counter()
     rep = _run_once(opts, engine, kind, args.quiet)

@@ -17,3 +17,6 @@ input/
 output/
 .workbuddy-ai/
 report.json
+
+# generated graphify knowledge graph
+graphify-out/

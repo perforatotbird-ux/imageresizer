@@ -23,10 +23,11 @@ except Exception:  # pragma: no cover
 class CpuEngine:
     name = "cpu"
 
-    def __init__(self, filter_name: str = "lanczos3"):
+    def __init__(self, filter_name: str = "lanczos3", optimize_huffman: bool = False):
         if cv2 is None:
             raise RuntimeError("opencv-python-headless is required for the CPU backend")
         self.filter = filter_name
+        self.optimize_huffman = bool(optimize_huffman)
 
     # -- decode --------------------------------------------------------------
     @staticmethod
@@ -61,11 +62,20 @@ class CpuEngine:
     def composite_bg(img: np.ndarray, bg_rgb: tuple[int, int, int]) -> np.ndarray:
         if img.shape[2] != 4:
             return img
-        b, g, r = bg_rgb[2], bg_rgb[1], bg_rgb[0]
-        alpha = img[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
-        bg_arr = np.array([b, g, r], dtype=np.float32)
-        out = img[:, :, :3].astype(np.float32) * alpha + bg_arr * (1.0 - alpha)
-        return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+        try:
+            from PIL import Image
+
+            b, g, r = bg_rgb[2], bg_rgb[1], bg_rgb[0]
+            fg = Image.fromarray(np.ascontiguousarray(img), "RGBA")
+            canvas = Image.new("RGBA", fg.size, (b, g, r, 255))
+            return np.ascontiguousarray(
+                np.asarray(Image.alpha_composite(canvas, fg).convert("RGB")))
+        except Exception:
+            b, g, r = bg_rgb[2], bg_rgb[1], bg_rgb[0]
+            alpha = img[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+            bg_arr = np.array([b, g, r], dtype=np.float32)
+            out = img[:, :, :3].astype(np.float32) * alpha + bg_arr * (1.0 - alpha)
+            return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
     @staticmethod
     def apply_orientation(img: np.ndarray, orientation: int) -> np.ndarray:
@@ -93,8 +103,10 @@ class CpuEngine:
         return resample_cpu(img, plan, self.filter)
 
     # -- encode --------------------------------------------------------------
-    @staticmethod
-    def encode(img: np.ndarray, quality: int, subsampling: int) -> bytes:
+    def encode(self, img: np.ndarray, quality: int, subsampling: int,
+               qtables: tuple[list[int], list[int]] | None = None) -> bytes:
+        if qtables is not None:
+            return self._encode_with_tables(img, subsampling, qtables)
         params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
         factor = {
             0: cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444,
@@ -102,10 +114,33 @@ class CpuEngine:
             2: cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420,
         }[subsampling]
         params += [int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), int(factor)]
+        if self.optimize_huffman:
+            # Optimized Huffman tables: ~20-25% smaller files at the same
+            # quality (mirrors the GPU backend's `optimized_huffman` flag).
+            params += [int(cv2.IMWRITE_JPEG_OPTIMIZE), 1]
         ok, buf = cv2.imencode(".jpg", img, params)
         if not ok:
             raise RuntimeError("cv2.imencode failed")
         return buf.tobytes()
+
+    @staticmethod
+    def _encode_with_tables(img: np.ndarray, subsampling: int,
+                            qtables: tuple[list[int], list[int]]) -> bytes:
+        """Encode with the quantisation tables of the source file.
+
+        OpenCV cannot write custom quantisation tables, so this path uses
+        Pillow. The quality number is irrelevant here - the tables define the
+        compression completely.
+        """
+        import io
+        from PIL import Image
+
+        rgb = np.ascontiguousarray(img[:, :, ::-1])
+        buffer = io.BytesIO()
+        Image.fromarray(rgb).save(
+            buffer, "JPEG", qtables=[list(qtables[0]), list(qtables[1])],
+            subsampling={0: 0, 1: 1, 2: 2}[subsampling], optimize=True)
+        return buffer.getvalue()
 
     # -- full path -----------------------------------------------------------
     def process(self, data: bytes, plan: Plan, quality: int, subsampling: int,

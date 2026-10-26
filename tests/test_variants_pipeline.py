@@ -113,3 +113,21 @@ class TestVariants:
         assert rep["processed"] == 0
         assert not (out / "thumb" / "a.jpg").exists()
         assert not (out / "web" / "a.jpg").exists()
+
+
+    def test_variant_cover_inherits_crop_anchor(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        # Create an image 100x200
+        (src / "tall.png").write_bytes(png(size=(100, 200)))
+        out = tmp_path / "out"
+        opts = RunOptions(
+            src, out, 100, 100, workers=1,
+            crop_anchor="top",
+            variants=(OutputVariant(id="square", max_w=100, max_h=100, mode="cover"),),
+        )
+        p = Pipeline(opts, None, "cpu", progress=False)
+        rep = p.run()
+        assert rep["complete"]
+        square = out / "square" / "tall.jpg"
+        assert square.exists()

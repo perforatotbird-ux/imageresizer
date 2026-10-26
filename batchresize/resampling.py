@@ -12,6 +12,7 @@ Supported filters:
 from __future__ import annotations
 
 import math
+import os
 from typing import Tuple
 
 import numpy as np
@@ -27,6 +28,16 @@ PIL_FILTER_MAP = {
     "bilinear": Image.Resampling.BILINEAR,
     "box": Image.Resampling.BOX,
     "nearest": Image.Resampling.NEAREST,
+}
+
+RESAMPLE_ENGINE = os.environ.get("BATCHRESIZE_RESAMPLE_ENGINE", "auto").strip().lower()
+
+_CV_FILTER_MAP = {
+    "lanczos3": "INTER_LANCZOS4",
+    "mitchell": "INTER_CUBIC",
+    "area": "INTER_AREA",
+    "bilinear": "INTER_LINEAR",
+    "box": "INTER_AREA",
 }
 
 
@@ -159,12 +170,114 @@ def separable_resample_float(img: np.ndarray, plan: Plan, filter_name: str) -> n
     return out
 
 
+def _pixel_region(plan: Plan, src_h: int, src_w: int):
+    """Whole-pixel source box for a plan (sub-pixel crop is rounded).
+
+    Plans may sit a fraction of a pixel outside the source because of float
+    geometry. Such regions are clamped to the source; anything genuinely
+    outside falls back to the reference engine.
+    """
+    raw_x0, raw_y0 = plan.x0, plan.y0
+    raw_x1, raw_y1 = plan.x0 + plan.cw, plan.y0 + plan.ch
+    if (raw_x0 < -0.5 or raw_y0 < -0.5
+            or raw_x1 > src_w + 0.5 or raw_y1 > src_h + 0.5):
+        return None
+    x0 = max(0, min(src_w - 1, int(round(raw_x0))))
+    y0 = max(0, min(src_h - 1, int(round(raw_y0))))
+    x1 = max(x0 + 1, min(src_w, int(round(raw_x1))))
+    y1 = max(y0 + 1, min(src_h, int(round(raw_y1))))
+    return y0, y1, x0, x1
+
+
+def _nearest_resample(img: np.ndarray, plan: Plan, region) -> np.ndarray:
+    """Exact nearest-neighbour gather for the whole-pixel source region."""
+    y0, y1, x0, x1 = region
+    idx_x, _ = build_separable_weights(x1 - x0, plan.out_w,
+                                       plan.out_w / (x1 - x0), 0.0, "nearest")
+    idx_y, _ = build_separable_weights(y1 - y0, plan.out_h,
+                                       plan.out_h / (y1 - y0), 0.0, "nearest")
+    source = img[y0:y1, x0:x1]
+    return np.ascontiguousarray(source[idx_y[:, 0][:, None], idx_x[:, 0][None, :]])
+
+
+def _cv2_resample(img: np.ndarray, plan: Plan, filter_name: str):
+    """Fast full-region resampling through OpenCV's specialized SIMD kernels.
+
+    Returns ``None`` when the reference engine was requested explicitly;
+    callers then use the separable reference implementation.
+    """
+    if RESAMPLE_ENGINE in ("reference", "pillow"):
+        return None
+    region = _pixel_region(plan, img.shape[0], img.shape[1])
+    if region is None:
+        return None
+    y0, y1, x0, x1 = region
+    scale_x = plan.out_w / (x1 - x0)
+    scale_y = plan.out_h / (y1 - y0)
+    if filter_name in ("area", "box") and (scale_x > 1.0 or scale_y > 1.0):
+        return None
+    if filter_name == "nearest":
+        return _nearest_resample(img, plan, region)
+
+    import cv2
+
+    interpolation = getattr(cv2, _CV_FILTER_MAP[filter_name])
+    source = img[y0:y1, x0:x1]
+    return cv2.resize(source, (plan.out_w, plan.out_h),
+                      interpolation=interpolation)
+
+
+def _pillow_resample(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
+    """Previous Pillow engine, retained for numeric A/B comparison."""
+    rgb = Image.fromarray(np.ascontiguousarray(img[:, :, ::-1]))
+    box = (plan.x0, plan.y0, plan.x0 + plan.cw, plan.y0 + plan.ch)
+    out = rgb.resize((plan.out_w, plan.out_h), PIL_FILTER_MAP[filter_name], box=box)
+    return np.ascontiguousarray(np.asarray(out)[:, :, ::-1])
+
+
+def resample_cpu_float(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
+    """Fast float32 resampling for the linear-light pipeline.
+
+    OpenCV's float kernels operate on the same whole-pixel source region as
+    the uint8 path. ``area``/``box`` upscaling and genuinely out-of-bounds
+    plans fall back to the separable reference.
+    """
+    dimensions(plan.out_w, plan.out_h)
+    if img.ndim != 3 or img.dtype != np.float32:
+        raise ValueError("float resample requires float32 image")
+    if plan.is_identity:
+        return np.ascontiguousarray(img)
+    if filter_name not in SUPPORTED_FILTERS:
+        raise ValueError(f"unknown filter {filter_name!r}")
+    if RESAMPLE_ENGINE not in ("reference", "pillow"):
+        region = _pixel_region(plan, img.shape[0], img.shape[1])
+        if region is not None:
+            y0, y1, x0, x1 = region
+            scale_x = plan.out_w / (x1 - x0)
+            scale_y = plan.out_h / (y1 - y0)
+            if filter_name not in ("area", "box") or (scale_x <= 1.0 and scale_y <= 1.0):
+                if filter_name == "nearest":
+                    return _nearest_resample(img, plan, region)
+                import cv2
+
+                filter_key = _CV_FILTER_MAP[filter_name]
+                # Lanczos4 rings visibly on large linear-light reductions.
+                # Area averaging is both closer to the reference result and
+                # cheaper when each output pixel covers many source pixels.
+                if filter_name in ("lanczos3", "mitchell") and max(scale_x, scale_y) <= 0.5:
+                    filter_key = "INTER_AREA"
+                source = np.ascontiguousarray(img[y0:y1, x0:x1])
+                return cv2.resize(source, (plan.out_w, plan.out_h),
+                                  interpolation=getattr(cv2, filter_key))
+    return separable_resample_float(img, plan, filter_name)
+
+
 def resample_cpu(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
     """Resample a BGR uint8 image according to plan.
 
-    Uses Pillow for lanczos3, bilinear, box, nearest to ensure maximum speed and
-    byte-compatibility with existing tests; uses separable reference for mitchell
-    and area.
+    OpenCV SIMD kernels handle the common full-frame (and integer-crop) case;
+    the separable float reference remains available via
+    ``BATCHRESIZE_RESAMPLE_ENGINE=reference`` and for sub-pixel crops.
     """
     dimensions(plan.out_w, plan.out_h)
     if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
@@ -174,11 +287,9 @@ def resample_cpu(img: np.ndarray, plan: Plan, filter_name: str) -> np.ndarray:
     if filter_name not in SUPPORTED_FILTERS:
         raise ValueError(f"unknown filter {filter_name!r}")
 
-    if filter_name in PIL_FILTER_MAP:
-        rgb = Image.fromarray(np.ascontiguousarray(img[:, :, ::-1]))
-        box = (plan.x0, plan.y0, plan.x0 + plan.cw, plan.y0 + plan.ch)
-        out = rgb.resize((plan.out_w, plan.out_h), PIL_FILTER_MAP[filter_name], box=box)
-        return np.ascontiguousarray(np.asarray(out)[:, :, ::-1])
-
-    # mitchell and area filters:
+    if RESAMPLE_ENGINE == "pillow" and filter_name in PIL_FILTER_MAP:
+        return _pillow_resample(img, plan, filter_name)
+    fast = _cv2_resample(img, plan, filter_name)
+    if fast is not None:
+        return fast
     return separable_resample(img, plan, filter_name)

@@ -400,7 +400,14 @@ class GpuEngine:
             jp.optimized_huffman = True
         return ep
 
-    def encode(self, arr, quality: int, subsampling: int) -> bytes:
+    def encode(self, arr, quality: int, subsampling: int,
+               qtables: tuple[list[int], list[int]] | None = None) -> bytes:
+        """Encode a JPEG frame.
+
+        ``qtables`` (the quantisation tables of the source file) is accepted
+        for interface symmetry with the CPU engine, but nvJPEG cannot write
+        custom quantisation tables - the quality number is used instead.
+        """
         if arr.dtype != self.cp.uint8 or arr.ndim != 3 or int(arr.shape[2]) != 3:
             raise ValueError("JPEG encoder requires uint8 RGB")
         arr = self.cp.ascontiguousarray(arr)
@@ -456,11 +463,12 @@ class GpuEngine:
         return result
 
     def process_array(self, arr, plan: Plan, quality: int, subsampling: int,
-                      bg: tuple[int, int, int] = (255, 255, 255)) -> bytes:
+                      bg: tuple[int, int, int] = (255, 255, 255),
+                      qtables: tuple[list[int], list[int]] | None = None) -> bytes:
         if int(arr.shape[2]) == 4:
             arr = self.alpha_to_rgb(arr, bg)
         small = self.resize(arr, plan)
-        return self.encode(small, quality, subsampling)
+        return self.encode(small, quality, subsampling, qtables)
 
     def process_bytes(self, data: bytes, plan: Plan, quality: int,
                       subsampling: int) -> bytes:

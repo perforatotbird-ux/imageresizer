@@ -26,9 +26,40 @@ from .geometry import Plan, compute_box, make_plan
 from .imageio_meta import (SourceMeta, has_alpha_hint, is_truncated_jpeg,
                            read_source_meta, splice_metadata)
 from .presets import SUBSAMPLING_NAMES, auto_subsampling
+from .source_quality import (FALLBACK_QUALITY, FALLBACK_SUBSAMPLING,
+                              QUALITY_SOURCE, SUBSAMPLING_SOURCE,
+                              estimate_source_quality, read_subsampling,
+                              source_quantisation_tables)
 from .variants import OutputVariant
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _default_working_bytes() -> int:
+    """Soft CPU working-set budget: 2 GiB, capped at a quarter of physical RAM."""
+    cap = 2048 * 2**20
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            quarter = int(status.ullTotalPhys // 4)
+            return max(512 * 2**20, min(cap, quarter))
+    except Exception:
+        pass
+    return cap
 
 
 @dataclass
@@ -61,7 +92,7 @@ class RunOptions:
     verbose: bool = False
     max_source_bytes: int = 128 * 2**20
     max_queued_bytes: int = 256 * 2**20
-    max_working_bytes: int = 1024 * 2**20
+    max_working_bytes: int = field(default_factory=_default_working_bytes)
     profile_cuda: bool = False
     cancel_file: Optional[Path] = None
     variants: tuple[OutputVariant, ...] = ()
@@ -74,8 +105,12 @@ class RunOptions:
     crop_focus: Optional[Any] = None
     max_file_size: Optional[int | str] = None
     min_quality: int = 30
+    source_fallback_quality: int = FALLBACK_QUALITY
     allow_downscale_on_size_limit: bool = False
     fast_jpeg_decode: bool = False
+    processors: Optional[int] = None
+    readers: Optional[int] = None
+    writers: Optional[int] = None
 
     def __post_init__(self):
         self.variants = tuple(self.variants)
@@ -102,6 +137,10 @@ class RunOptions:
         if (isinstance(self.min_quality, bool) or int(self.min_quality) != self.min_quality or
                 not 1 <= self.min_quality <= 100):
             raise ValueError("min_quality must be an integer between 1 and 100")
+        if (isinstance(self.source_fallback_quality, bool) or
+                int(self.source_fallback_quality) != self.source_fallback_quality or
+                not 1 <= self.source_fallback_quality <= 100):
+            raise ValueError("source_fallback_quality must be an integer between 1 and 100")
         if not isinstance(self.allow_downscale_on_size_limit, bool):
             raise ValueError("allow_downscale_on_size_limit must be a boolean")
         if not isinstance(self.fast_jpeg_decode, bool):
@@ -114,14 +153,27 @@ class RunOptions:
             positive(value, name)
             if int(value) != value or value > cap:
                 raise ValueError(f"{name} must be an integer <= {cap}")
+        for val, name, cap in [(self.processors, "processors", 128),
+                               (self.readers, "readers", 128),
+                               (self.writers, "writers", 128)]:
+            if val is not None:
+                positive(val, name)
+                if int(val) != val or val > cap:
+                    raise ValueError(f"{name} must be an integer <= {cap}")
         if self.limit is not None and (self.limit < 1 or int(self.limit) != self.limit):
             raise ValueError("limit must be a positive integer")
-        if (isinstance(self.quality, bool) or int(self.quality) != self.quality or
-                not 1 <= self.quality <= 100 or isinstance(self.subsampling, bool) or
-                self.subsampling not in (0, 1, 2)):
-            raise ValueError("invalid JPEG quality/subsampling")
-        if self.min_quality > self.quality:
-            raise ValueError("min_quality cannot be greater than quality")
+        if self.quality == QUALITY_SOURCE:
+            if self.subsampling not in (0, 1, 2, SUBSAMPLING_SOURCE):
+                raise ValueError("invalid JPEG quality/subsampling")
+        else:
+            if (isinstance(self.quality, bool) or int(self.quality) != self.quality or
+                    not 1 <= self.quality <= 100 or isinstance(self.subsampling, bool) or
+                    self.subsampling not in (0, 1, 2)):
+                raise ValueError("invalid JPEG quality/subsampling")
+            if self.min_quality > self.quality:
+                if self.max_file_size is not None:
+                    raise ValueError("min_quality cannot be greater than quality")
+                object.__setattr__(self, "min_quality", self.quality)
         from .resampling import SUPPORTED_FILTERS
         if self.filter_name not in SUPPORTED_FILTERS:
             raise ValueError("unknown filter")
@@ -154,6 +206,8 @@ class OutputTask:
     quality: int
     subsampling: int
     config_digest: str
+    #: Quantisation tables of the source file ("same as source" mode).
+    qtables: Optional[tuple[list[int], list[int]]] = None
 
 
 @dataclass
@@ -388,6 +442,23 @@ _EOF = object()
 JOIN_TIMEOUT = 5.0
 WRITER_STALL_TIMEOUT = 30.0
 
+# Backend labels recorded per result. A GPU decode/resize/encode route is any
+# non-CPU label; 'hybrid' means host decode + GPU resize/encode.
+GPU_DECODE_LABELS = frozenset({"gpu", "gpu-engine", "nvimgcodec-auto"})
+GPU_COMPUTE_LABELS = GPU_DECODE_LABELS | frozenset({"hybrid"})
+
+
+def actual_route_flags(backend_counts) -> tuple[bool, bool]:
+    """Return ``(used_gpu_decode, used_gpu_compute)`` from recorded labels.
+
+    Keeping this in one place prevents the report's route strings from drifting
+    away from the labels written by ``_finish`` (AUD-001).
+    """
+    labels = set(backend_counts or ())
+    gpu_decode = bool(labels & GPU_DECODE_LABELS)
+    gpu_compute = gpu_decode or "hybrid" in labels
+    return gpu_decode, gpu_compute
+
 
 class Pipeline:
     """Threaded stages connected by bounded queues.
@@ -401,7 +472,7 @@ class Pipeline:
         self._fixed_files = list(files) if files is not None else None
         if engine is None and backend == "cpu":
             from .cpu_backend import CpuEngine
-            engine = CpuEngine(opts.filter_name)
+            engine = CpuEngine(opts.filter_name, opts.optimize_huffman)
         self.engine = engine
         self.backend = backend
         self.stats = Stats()
@@ -437,13 +508,16 @@ class Pipeline:
         self._last_progress = 0.0
         self._writer_stall_timeout = WRITER_STALL_TIMEOUT
 
-        if backend == "cpu":
-            self._n_readers = max(1, opts.workers)
-            self._n_processors = max(1, opts.workers)
+        self._gpu_lock = threading.Lock()
+        base_workers = max(1, opts.workers)
+        self._n_readers = max(1, opts.readers) if opts.readers is not None else base_workers
+        if opts.processors is not None:
+            self._n_processors = max(1, opts.processors)
+        elif backend == "cpu":
+            self._n_processors = base_workers
         else:
-            self._n_readers = max(1, opts.workers)
             self._n_processors = 1
-        self._n_writers = max(2, max(1, opts.workers) // 2)
+        self._n_writers = max(1, opts.writers) if opts.writers is not None else max(2, base_workers // 2)
 
         self._readers: list[threading.Thread] = []
         self._processors: list[threading.Thread] = []
@@ -525,6 +599,24 @@ class Pipeline:
             return job.outputs
         return (OutputTask(None, job.out, job.plan, self.opts.quality,
                            self.opts.subsampling, ""),)
+
+    def _resolve_source_profile(self, data: bytes, quality, subsampling):
+        """Per-file quality/subsampling for the "same as source" mode.
+
+        Returns ``(quality, subsampling, qtables)``. The quantisation tables
+        of the source are copied verbatim so that only the geometry changes.
+        """
+        if quality != QUALITY_SOURCE and subsampling != SUBSAMPLING_SOURCE:
+            return quality, subsampling, None
+        tables = source_quantisation_tables(data)
+        if quality == QUALITY_SOURCE:
+            estimated = estimate_source_quality(data)
+            quality = (estimated if estimated is not None
+                       else self.opts.source_fallback_quality)
+        if subsampling == SUBSAMPLING_SOURCE:
+            detected = read_subsampling(data)
+            subsampling = detected if detected is not None else FALLBACK_SUBSAMPLING
+        return quality, subsampling, tables
 
     @contextmanager
     def _working(self, job):
@@ -625,7 +717,9 @@ class Pipeline:
                                 variant.sizing_value)
                             plan = make_plan(meta.display_width, meta.display_height,
                                              box_w, box_h, variant.mode,
-                                             variant.allow_upscale)
+                                             variant.allow_upscale,
+                                             anchor=self.opts.crop_anchor,
+                                             focus=self.opts.crop_focus)
                             tasks.append(OutputTask(
                                 variant.id, targets[variant.id], plan,
                                 variant.quality, subsampling,
@@ -640,9 +734,11 @@ class Pipeline:
                                          self.opts.mode, self.opts.allow_upscale,
                                          anchor=self.opts.crop_anchor,
                                          focus=self.opts.crop_focus)
+                        quality, subsampling, qtables = self._resolve_source_profile(
+                            data, self.opts.quality, self.opts.subsampling)
                         tasks.append(OutputTask(
-                            None, targets[None], plan, self.opts.quality,
-                            self.opts.subsampling, self._resume.fingerprint))
+                            None, targets[None], plan, quality,
+                            subsampling, self._resume.fingerprint, qtables))
                     job = Job(src, tasks[0].out, data, meta, tasks[0].plan,
                               meta.has_alpha, digest, tuple(tasks),
                               t_queued=time.perf_counter())
@@ -662,7 +758,8 @@ class Pipeline:
                                 continue
                             self._fail_output(job, task, FileExistsError(
                                 "existing output is unverified or configuration "
-                                "changed; use --overwrite"))
+                                "changed; --skip-existing skips verified results "
+                                "only - re-run with --overwrite to rebuild it"))
                             self._complete_output(src)
                         tasks = remaining_tasks
                     if not tasks:
@@ -723,7 +820,8 @@ class Pipeline:
                 for job in batch:
                     self._process_hybrid_one(job)
             else:
-                self._process_gpu_batch(batch)
+                with self._gpu_lock:
+                    self._process_gpu_batch(batch)
 
     @staticmethod
     def _gpu_estimate(job):
@@ -831,6 +929,116 @@ class Pipeline:
                 "worker failure prevented publication"))
             self._complete_output(job.src)
 
+    def _encode_with_size_limit(self, job: Job, task: OutputTask, small, engine):
+        actual_quality = task.quality
+        target_size_achieved = None
+        if self.opts.max_file_size:
+            from .size_limit import optimize_jpeg_quality, parse_size_bytes
+            max_bytes = parse_size_bytes(self.opts.max_file_size)
+
+            def splice_check(j: bytes) -> bytes:
+                output_icc = None
+                if self.opts.keep_icc:
+                    from .color_management import SRGB_ICC_BYTES, COLOR_POLICY_SRGB
+                    if self.opts.color_policy == COLOR_POLICY_SRGB:
+                        output_icc = SRGB_ICC_BYTES
+                    elif job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"):
+                        output_icc = SRGB_ICC_BYTES
+                    elif job.meta.icc:
+                        output_icc = job.meta.icc
+                if self.opts.keep_exif or self.opts.keep_icc or self.opts.strip_personal_data:
+                    return splice_metadata(
+                        j,
+                        job.meta.exif if self.opts.keep_exif else None,
+                        output_icc,
+                        dimensions=(task.plan.target_w, task.plan.target_h),
+                        strip_personal=self.opts.strip_personal_data,
+                        keep_datetime=self.opts.keep_datetime,
+                    )
+                return j
+
+            def encode_fn(im, q):
+                return engine.encode(im, q, task.subsampling, task.qtables)
+
+            if task.qtables is not None:
+                # "Same as source": the quantisation tables fix the
+                # compression, a quality search cannot change it.
+                jpeg = splice_check(encode_fn(small, task.quality))
+                actual_quality = task.quality
+                target_size_achieved = len(jpeg) <= max_bytes
+            else:
+                jpeg, actual_quality, target_size_achieved = optimize_jpeg_quality(
+                    encode_fn,
+                    small,
+                    initial_quality=task.quality,
+                    min_quality=self.opts.min_quality,
+                    max_bytes=max_bytes,
+                    splice_fn=splice_check,
+                )
+
+            if not target_size_achieved and self.opts.allow_downscale_on_size_limit:
+                import cv2
+                is_gpu_arr = hasattr(engine, "cp") and isinstance(small, engine.cp.ndarray)
+                host_img = engine.cp.asnumpy(small) if is_gpu_arr else small
+                curr_img = host_img
+                for scale_factor in (0.85, 0.70, 0.50, 0.35, 0.25):
+                    nw = max(8, int(round(small.shape[1] * scale_factor)))
+                    nh = max(8, int(round(small.shape[0] * scale_factor)))
+                    if nw >= curr_img.shape[1] and nh >= curr_img.shape[0]:
+                        continue
+                    curr_img = cv2.resize(host_img, (nw, nh), interpolation=cv2.INTER_AREA)
+                    dev_img = engine.to_device(curr_img) if is_gpu_arr else curr_img
+                    if task.qtables is not None:
+                        trial_jpeg = splice_check(encode_fn(dev_img, task.quality))
+                        trial_q = task.quality
+                        trial_achieved = len(trial_jpeg) <= max_bytes
+                    else:
+                        trial_jpeg, trial_q, trial_achieved = optimize_jpeg_quality(
+                            encode_fn,
+                            dev_img,
+                            initial_quality=task.quality,
+                            min_quality=self.opts.min_quality,
+                            max_bytes=max_bytes,
+                            splice_fn=splice_check,
+                            max_trials=4,
+                            max_seconds=1.0,
+                        )
+                    if trial_achieved:
+                        jpeg = trial_jpeg
+                        actual_quality = trial_q
+                        target_size_achieved = True
+                        task = OutputTask(
+                            task.variant_id,
+                            task.out,
+                            Plan(
+                                src_w=task.plan.src_w,
+                                src_h=task.plan.src_h,
+                                out_w=nw,
+                                out_h=nh,
+                                x0=task.plan.x0,
+                                y0=task.plan.y0,
+                                cw=task.plan.cw,
+                                ch=task.plan.ch,
+                                canvas_w=nw if task.plan.is_pad else 0,
+                                canvas_h=nh if task.plan.is_pad else 0,
+                                pad_left=0,
+                                pad_top=0,
+                            ),
+                            task.quality,
+                            task.subsampling,
+                            task.config_digest,
+                            task.qtables,
+                        )
+                        break
+
+            if not target_size_achieved and len(self._warnings) < 50:
+                self._warnings.append(
+                    f"{job.src}: target file size {max_bytes} bytes unreachable at min_quality {self.opts.min_quality} (actual {len(jpeg)} bytes)"
+                )
+        else:
+            jpeg = engine.encode(small, task.quality, task.subsampling, task.qtables)
+        return task, jpeg, actual_quality, target_size_achieved
+
     def _process_cpu_one(self, job: Job, engine=None, backend="cpu") -> None:
         engine = engine or self.engine
         try:
@@ -843,15 +1051,25 @@ class Pipeline:
                 composite_linear_bg,
                 COLOR_POLICY_SRGB,
             )
-            from .resampling import separable_resample_float
+            from .resampling import resample_cpu_float
 
             t0 = time.perf_counter()
+            # An untagged RGB/RGBA image has no profile to convert; the sRGB
+            # policy only needs to attach the standard output profile, which
+            # _finish does. Decode it with OpenCV instead of the Pillow/CMS path.
+            fast_untagged = (
+                not job.meta.icc and job.meta.mode in ("RGB", "RGBA")
+            )
+            fast_srgb = (
+                self.opts.color_policy == COLOR_POLICY_SRGB and fast_untagged
+            )
+            fast_linear = self.opts.linear_light and fast_untagged
             needs_cms = (
-                self.opts.color_policy == COLOR_POLICY_SRGB
-                or self.opts.linear_light
-                or job.has_alpha
+                (self.opts.color_policy == COLOR_POLICY_SRGB and not fast_srgb)
+                or (self.opts.linear_light and not fast_linear)
+                or (job.has_alpha and job.meta.mode != "RGBA")
                 or (job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"))
-                or job.meta.mode not in ("RGB", "RGBA")
+                or job.meta.mode not in ("RGB", "RGBA", "L", "CMYK")
             )
             tasks = self._job_tasks(job)
             reduce_scale = 1
@@ -908,27 +1126,28 @@ class Pipeline:
                         exec_plan = scale_plan_for_reduced_decode(task.plan, reduce_scale)
 
                     if self.opts.linear_light:
-                        bgr = img[:, :, :3]
-                        rgb = bgr[:, :, ::-1]
-                        rgb_lin = srgb_to_linear(rgb)
                         if img.shape[2] == 4 or job.has_alpha or has_alpha:
+                            bgr = img[:, :, :3]
+                            rgb = bgr[:, :, ::-1]
+                            rgb_lin = srgb_to_linear(rgb)
                             alpha = img[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
                             rgba_lin = np.concatenate([rgb_lin, alpha], axis=2)
                             rgba_premul = premultiply_alpha(rgba_lin)
-                            res_premul = separable_resample_float(
+                            res_premul = resample_cpu_float(
                                 rgba_premul, exec_plan, self.opts.filter_name
                             )
                             comp_lin = composite_linear_bg(
                                 res_premul, self.opts.bg_color, is_premultiplied=True
                             )
-                            small_rgb = linear_to_srgb(comp_lin)
-                            small = small_rgb[:, :, ::-1]
+                            small = linear_to_srgb(comp_lin)[:, :, ::-1]
                         else:
-                            res_lin = separable_resample_float(
-                                rgb_lin, exec_plan, self.opts.filter_name
+                            # Channel order is irrelevant to the per-channel LUT
+                            # and to the resampler, so stay in BGR and skip two
+                            # full-frame channel reversals.
+                            res_lin = resample_cpu_float(
+                                srgb_to_linear(img), exec_plan, self.opts.filter_name
                             )
-                            small_rgb = linear_to_srgb(res_lin)
-                            small = small_rgb[:, :, ::-1]
+                            small = linear_to_srgb(res_lin)
                     else:
                         small = engine.resize(img, exec_plan)
 
@@ -940,97 +1159,7 @@ class Pipeline:
                         small = apply_pad(small, task.plan, self.opts.bg_color)
                     t4 = time.perf_counter()
 
-                    actual_quality = task.quality
-                    target_size_achieved = None
-                    if self.opts.max_file_size:
-                        from .size_limit import optimize_jpeg_quality, parse_size_bytes
-                        max_bytes = parse_size_bytes(self.opts.max_file_size)
-
-                        def splice_check(j: bytes) -> bytes:
-                            output_icc = None
-                            if self.opts.keep_icc:
-                                from .color_management import SRGB_ICC_BYTES, COLOR_POLICY_SRGB
-                                if self.opts.color_policy == COLOR_POLICY_SRGB:
-                                    output_icc = SRGB_ICC_BYTES
-                                elif job.meta.icc and job.meta.mode not in ("RGB", "RGBA", "P"):
-                                    output_icc = SRGB_ICC_BYTES
-                                elif job.meta.icc:
-                                    output_icc = job.meta.icc
-                            if self.opts.keep_exif or self.opts.keep_icc or self.opts.strip_personal_data:
-                                return splice_metadata(
-                                    j,
-                                    job.meta.exif if self.opts.keep_exif else None,
-                                    output_icc,
-                                    dimensions=(task.plan.target_w, task.plan.target_h),
-                                    strip_personal=self.opts.strip_personal_data,
-                                    keep_datetime=self.opts.keep_datetime,
-                                )
-                            return j
-
-                        def encode_fn(im, q):
-                            return engine.encode(im, q, task.subsampling)
-
-                        jpeg, actual_quality, target_size_achieved = optimize_jpeg_quality(
-                            encode_fn,
-                            small,
-                            initial_quality=task.quality,
-                            min_quality=self.opts.min_quality,
-                            max_bytes=max_bytes,
-                            splice_fn=splice_check,
-                        )
-
-                        if not target_size_achieved and self.opts.allow_downscale_on_size_limit:
-                            import cv2
-                            curr_img = small
-                            for scale_factor in (0.85, 0.70, 0.50, 0.35, 0.25):
-                                nw = max(8, int(round(small.shape[1] * scale_factor)))
-                                nh = max(8, int(round(small.shape[0] * scale_factor)))
-                                if nw >= curr_img.shape[1] and nh >= curr_img.shape[0]:
-                                    continue
-                                curr_img = cv2.resize(small, (nw, nh), interpolation=cv2.INTER_AREA)
-                                trial_jpeg, trial_q, trial_achieved = optimize_jpeg_quality(
-                                    encode_fn,
-                                    curr_img,
-                                    initial_quality=task.quality,
-                                    min_quality=self.opts.min_quality,
-                                    max_bytes=max_bytes,
-                                    splice_fn=splice_check,
-                                    max_trials=4,
-                                    max_seconds=1.0,
-                                )
-                                if trial_achieved:
-                                    jpeg = trial_jpeg
-                                    actual_quality = trial_q
-                                    target_size_achieved = True
-                                    task = OutputTask(
-                                        task.variant_id,
-                                        task.out,
-                                        Plan(
-                                            src_w=task.plan.src_w,
-                                            src_h=task.plan.src_h,
-                                            out_w=nw,
-                                            out_h=nh,
-                                            x0=task.plan.x0,
-                                            y0=task.plan.y0,
-                                            cw=task.plan.cw,
-                                            ch=task.plan.ch,
-                                            canvas_w=nw if task.plan.is_pad else 0,
-                                            canvas_h=nh if task.plan.is_pad else 0,
-                                            pad_left=0,
-                                            pad_top=0,
-                                        ),
-                                        task.quality,
-                                        task.subsampling,
-                                        task.config_digest,
-                                    )
-                                    break
-
-                        if not target_size_achieved and len(self._warnings) < 50:
-                            self._warnings.append(
-                                f"{job.src}: target file size {max_bytes} bytes unreachable at min_quality {self.opts.min_quality} (actual {len(jpeg)} bytes)"
-                            )
-                    else:
-                        jpeg = engine.encode(small, task.quality, task.subsampling)
+                    task, jpeg, actual_quality, target_size_achieved = self._encode_with_size_limit(job, task, small, engine)
                     t5 = time.perf_counter()
                     timings = {"decode": (t1 - t0) / count,
                                "normalize": (t2 - t1) / count,
@@ -1068,22 +1197,11 @@ class Pipeline:
                 self._gpu_fallback(batch[0], RuntimeError(error))
 
     def _process_gpu_batch_inner(self, batch):
-        if self.opts.sharpen.enabled:
-            for job in batch:
-                self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
-            return
         if self.opts.linear_light:
             for job in batch:
                 self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
             return
-        if self.opts.mode == "pad" or any(t.plan.is_pad for j in batch for t in self._job_tasks(j)):
-            for job in batch:
-                self._gpu_fallback(job, RuntimeError("pad mode is not supported on GPU backend"))
-            return
-        if self.opts.max_file_size:
-            for job in batch:
-                self._gpu_fallback(job, RuntimeError("target file size limit is not supported on GPU backend"))
-            return
+
         # Managed colour conversion cannot copy a CMYK/gray profile onto RGB.
         from .color_management import COLOR_POLICY_SRGB
         if self.opts.color_policy == COLOR_POLICY_SRGB:
@@ -1118,17 +1236,23 @@ class Pipeline:
                 for task in tasks:
                     try:
                         small = self.engine.resize(arr, task.plan)
+                        if self.opts.sharpen.enabled:
+                            from .sharpen import apply_sharpen
+                            small = apply_sharpen(small, self.opts.sharpen)
+                        if task.plan.is_pad:
+                            from .geometry import apply_pad
+                            small = apply_pad(small, task.plan, self.opts.bg_color)
                         self._sync_profile()
                         t3 = time.perf_counter()
-                        jpeg = self.engine.encode(small, task.quality,
-                                                  task.subsampling)
+                        task, jpeg, actual_quality, target_size_achieved = self._encode_with_size_limit(
+                            job, task, small, self.engine)
                         self._sync_profile()
                         self._finish(job, task, jpeg, {
                             "decode": decode_time / count,
                             "normalize": (t2 - t1) / count,
                             "resize": t3 - t2,
                             "encode": time.perf_counter() - t3,
-                        }, "nvimgcodec-auto")
+                        }, "nvimgcodec-auto", actual_quality=actual_quality, target_size_achieved=target_size_achieved)
                     except Exception as exc:
                         self._gpu_fallback(job, exc)
                         break
@@ -1143,18 +1267,10 @@ class Pipeline:
         self._process_gpu_batch([job])
 
     def _process_hybrid_one(self, job):
-        if self.opts.sharpen.enabled:
-            self._gpu_fallback(job, RuntimeError("output sharpening is not supported on GPU backend"))
-            return
         if self.opts.linear_light:
             self._gpu_fallback(job, RuntimeError("linear-light resize is not supported on GPU backend"))
             return
-        if self.opts.mode == "pad" or any(t.plan.is_pad for t in self._job_tasks(job)):
-            self._gpu_fallback(job, RuntimeError("pad mode is not supported on GPU backend"))
-            return
-        if self.opts.max_file_size:
-            self._gpu_fallback(job, RuntimeError("target file size limit is not supported on GPU backend"))
-            return
+
         try:
             with self._working(job):
                 self._process_hybrid_inner(job)
@@ -1168,27 +1284,36 @@ class Pipeline:
             t0 = time.perf_counter()
             rgb, has_alpha = decode_to_rgb(job.data, self.opts.bg_color)
             t1 = time.perf_counter()
-            arr = engine.to_device(rgb)
-            arr = engine.apply_orientation(arr, job.meta.orientation)
-            self._sync_profile()
-            t2 = time.perf_counter()
-            if int(arr.shape[2]) == 4:
-                arr = engine.alpha_to_rgb(arr, self.opts.bg_color)
-            self._sync_profile()
-            tasks = self._job_tasks(job)
-            count = max(1, len(tasks))
-            for task in tasks:
-                small = engine.resize(arr, task.plan)
+            with self._gpu_lock:
+                arr = engine.to_device(rgb)
+                arr = engine.apply_orientation(arr, job.meta.orientation)
                 self._sync_profile()
-                t3 = time.perf_counter()
-                jpeg = engine.encode(small, task.quality, task.subsampling)
+                t2 = time.perf_counter()
+                if int(arr.shape[2]) == 4:
+                    arr = engine.alpha_to_rgb(arr, self.opts.bg_color)
                 self._sync_profile()
-                t4 = time.perf_counter()
-                timings = {"decode": (t1 - t0) / count,
-                           "normalize": (t2 - t1) / count,
-                           "resize": t3 - t2, "encode": t4 - t3}
-                self._sync_profile()
-                self._finish(job, task, jpeg, timings, "hybrid")
+                tasks = self._job_tasks(job)
+                count = max(1, len(tasks))
+                for task in tasks:
+                    small = engine.resize(arr, task.plan)
+                    if self.opts.sharpen.enabled:
+                        from .sharpen import apply_sharpen
+                        small = apply_sharpen(small, self.opts.sharpen)
+                    if task.plan.is_pad:
+                        from .geometry import apply_pad
+                        small = apply_pad(small, task.plan, self.opts.bg_color)
+                    self._sync_profile()
+                    t3 = time.perf_counter()
+                    task, jpeg, actual_quality, target_size_achieved = self._encode_with_size_limit(
+                        job, task, small, engine)
+                    self._sync_profile()
+                    t4 = time.perf_counter()
+                    timings = {"decode": (t1 - t0) / count,
+                               "normalize": (t2 - t1) / count,
+                               "resize": t3 - t2, "encode": t4 - t3}
+                    self._sync_profile()
+                    self._finish(job, task, jpeg, timings, "hybrid",
+                                 actual_quality=actual_quality, target_size_achieved=target_size_achieved)
         except Exception:
             raise
 
@@ -1209,7 +1334,8 @@ class Pipeline:
         self.stats.record_fallback(str(exc))
         try:
             with self._working(job):
-                self._process_cpu_one(job, CpuEngine(self.opts.filter_name), "cpu-fallback")
+                self._process_cpu_one(job, CpuEngine(self.opts.filter_name,
+                                                     self.opts.optimize_huffman), "cpu-fallback")
         except Exception as fallback_error:
             self._fail(job.src, fallback_error)
 
@@ -1464,6 +1590,7 @@ class Pipeline:
         processed = snap["processed"]
         per = (lambda v: round(1000.0 * v / processed, 3)) if processed else (lambda v: 0.0)
         from .observability import calculate_latency_stats
+        used_gpu_decode, used_gpu_compute = actual_route_flags(snap["backend_counts"])
         return {
             "complete": not interrupted and not self.fatal.is_set() and not self._discovery_errors
                         and snap["failed"] == 0,
@@ -1474,9 +1601,12 @@ class Pipeline:
             "backend_counts": snap["backend_counts"],
             "requested_backend": self.backend,
             "actual_routes": {
-                "decode": ("nvImageCodec automatic plugin" if "gpu" in snap["backend_counts"] else "OpenCV/Pillow CPU"),
-                "resize": ("CUDA separable kernel" if any(b in snap["backend_counts"] for b in ("gpu", "hybrid")) else "Pillow/CPU float"),
-                "encode": ("nvJPEG GPU" if any(b in snap["backend_counts"] for b in ("gpu", "hybrid")) else "OpenCV CPU JPEG"),
+                "decode": ("nvImageCodec automatic plugin" if used_gpu_decode
+                           else "OpenCV/Pillow CPU"),
+                "resize": ("CUDA separable kernel" if used_gpu_compute
+                           else "Pillow/CPU float"),
+                "encode": ("nvJPEG GPU" if used_gpu_compute
+                           else "OpenCV CPU JPEG"),
             },
             "codec_backend": getattr(self.engine, "backend_policy", "CPU/Pillow/OpenCV"),
             "codec_backend_attested": False,

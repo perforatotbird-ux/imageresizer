@@ -1,0 +1,359 @@
+{
+  "date": "2026-10-26",
+  "branch": "feature/mvp-0-3",
+  "base_commit": "b4fc6b6",
+  "environment": {
+    "os": "Windows 10 22H2 build 19045",
+    "cpu": "Intel Xeon E5-2670 v3, 12 cores / 24 logical processors",
+    "ram_gib": 15.8,
+    "gpu": "NVIDIA GeForce GTX 1060 6GB, SM 6.1",
+    "driver": "581.57",
+    "cuda_runtime": "12.9",
+    "python": "3.13.14",
+    "numpy": "2.5.4",
+    "opencv": "5.0.0.93",
+    "pillow": "13.0.0",
+    "cupy": "14.2.0",
+    "nvimgcodec": "0.9.0.20"
+  },
+  "corpus": {
+    "path": "input/",
+    "files": 517,
+    "mib": 688.0,
+    "large_22mp": 512,
+    "small_6_to_14mp": 5,
+    "subset_48": {
+      "large": 43,
+      "small": 5
+    },
+    "subset_96": {
+      "large": 91,
+      "small": 5
+    }
+  },
+  "baseline_48": {
+    "cpu_web_1024": {
+      "elapsed_s": 19.598,
+      "files_per_s": 2.45,
+      "read_ms": 575.8,
+      "decode_ms": 492.7,
+      "resize_ms": 811.6,
+      "encode_ms": 21.7,
+      "write_ms": 536.3
+    },
+    "cpu_large_1600": {
+      "elapsed_s": 18.53,
+      "files_per_s": 2.59,
+      "read_ms": 642.0,
+      "decode_ms": 406.2,
+      "resize_ms": 828.9,
+      "encode_ms": 29.2,
+      "write_ms": 503.4
+    },
+    "gpu_web_1024": {
+      "elapsed_s": 13.188,
+      "files_per_s": 3.64,
+      "read_ms": 466.0,
+      "decode_ms": 110.1,
+      "resize_ms": 119.4,
+      "encode_ms": 3.44,
+      "write_ms": 42.7
+    },
+    "gpu_large_1600": {
+      "elapsed_s": 13.664,
+      "files_per_s": 3.51,
+      "read_ms": 453.4,
+      "decode_ms": 122.5,
+      "resize_ms": 112.8,
+      "encode_ms": 9.09,
+      "write_ms": 34.9
+    }
+  },
+  "final_48": {
+    "cpu_web_1024_1g": {
+      "elapsed_s": 5.704,
+      "files_per_s": 8.42,
+      "read_ms": 16.4,
+      "decode_ms": 393.5,
+      "resize_ms": 20.9,
+      "encode_ms": 4.0,
+      "write_ms": 9.8
+    },
+    "cpu_web_1024_2g": {
+      "elapsed_s": 4.785,
+      "files_per_s": 10.03,
+      "read_ms": 23.1,
+      "decode_ms": 589.5,
+      "resize_ms": 42.7,
+      "encode_ms": 7.6,
+      "write_ms": 20.2
+    },
+    "cpu_large_1600_1g": {
+      "elapsed_s": 5.661,
+      "files_per_s": 8.48,
+      "read_ms": 15.5,
+      "decode_ms": 358.9,
+      "resize_ms": 38.4,
+      "encode_ms": 9.1,
+      "write_ms": 7.3
+    },
+    "cpu_large_1600_2g": {
+      "elapsed_s": 4.619,
+      "files_per_s": 10.39,
+      "read_ms": 18.9,
+      "decode_ms": 546.1,
+      "resize_ms": 57.2,
+      "encode_ms": 15.7,
+      "write_ms": 22.6
+    },
+    "gpu_web_1024": {
+      "elapsed_s": 4.679,
+      "files_per_s": 10.26,
+      "read_ms": 13.8,
+      "decode_ms": 81.6,
+      "resize_ms": 1.03,
+      "encode_ms": 3.3,
+      "write_ms": 19.2
+    },
+    "gpu_large_1600": {
+      "elapsed_s": 4.808,
+      "files_per_s": 9.98,
+      "read_ms": 13.7,
+      "decode_ms": 79.1,
+      "resize_ms": 1.1,
+      "encode_ms": 8.8,
+      "write_ms": 5.2
+    }
+  },
+  "final_96": {
+    "cpu_default": {
+      "elapsed_s": 9.639,
+      "files_per_s": 9.96
+    },
+    "cpu_16_processors": {
+      "elapsed_s": 9.65,
+      "files_per_s": 9.95
+    },
+    "cpu_fast_jpeg_decode": {
+      "elapsed_s": 6.145,
+      "files_per_s": 15.62
+    },
+    "gpu_default": {
+      "elapsed_s": 9.259,
+      "files_per_s": 10.37
+    }
+  },
+  "final_517": {
+    "cpu_web_1024": {
+      "elapsed_s": 48.208,
+      "wall_s": 49.13,
+      "files_per_s": 10.72,
+      "failed": 0,
+      "valid_outputs": 517
+    },
+    "gpu_web_1024": {
+      "elapsed_s": 51.277,
+      "wall_s": 57.197,
+      "files_per_s": 10.08,
+      "failed": 0,
+      "valid_outputs": 517
+    }
+  },
+  "scaling_48_cpu": [
+    {
+      "budget_mib": 1024,
+      "workers": 8,
+      "files_per_s": 8.42
+    },
+    {
+      "budget_mib": 2048,
+      "workers": 8,
+      "files_per_s": 9.9
+    },
+    {
+      "budget_mib": 2048,
+      "processors": 16,
+      "readers": 4,
+      "writers": 4,
+      "files_per_s": 10.76
+    },
+    {
+      "budget_mib": 3072,
+      "processors": 16,
+      "readers": 4,
+      "writers": 4,
+      "files_per_s": 10.51
+    }
+  ],
+  "gpu_tuning_48": [
+    {
+      "configuration": "batch 8, 8 workers",
+      "files_per_s": 10.26
+    },
+    {
+      "configuration": "batch 16",
+      "files_per_s": 10.37
+    },
+    {
+      "configuration": "batch 16, 3 GiB VRAM",
+      "files_per_s": 10.22
+    },
+    {
+      "configuration": "12 workers, 3 repeats",
+      "files_per_s": 10.4
+    }
+  ],
+  "memory_24": [
+    {
+      "budget_mib": 1024,
+      "peak_rss_mib": 816.1,
+      "files_per_s": 7.5
+    },
+    {
+      "budget_mib": 2048,
+      "peak_rss_mib": 1521.6,
+      "files_per_s": 8.9
+    }
+  ],
+  "complex_4_workers_files_per_s": {
+    "gray": {
+      "cpu_before": 4.1,
+      "cpu_after": 5.88,
+      "gpu_after": 13.69
+    },
+    "cmyk": {
+      "cpu_before": 2.65,
+      "cpu_after": 4.28,
+      "gpu_after": 6.06
+    },
+    "alpha_png": {
+      "cpu_before": 3.86,
+      "cpu_after": 6.86,
+      "gpu_after": 9.68
+    },
+    "alpha_webp": {
+      "cpu_before": 3.83,
+      "cpu_after": 6.61,
+      "gpu_after": 9.25
+    },
+    "orientation": {
+      "cpu_after": 6.0,
+      "gpu_after": 10.01
+    }
+  },
+  "optional_48": {
+    "default": 10.03,
+    "cover": 10.23,
+    "strip_personal_data": 10.07,
+    "sharpen_standard": 8.82,
+    "web_srgb": 10.16,
+    "linear_light_6_files": 3.28,
+    "two_outputs_jobs_per_s": 10.31,
+    "two_outputs_outputs_per_s": 20.6
+  },
+  "microbenchmarks_ms": {
+    "sha256_22mp": 3.16,
+    "read_source_meta": 0.096,
+    "is_truncated_jpeg_before_1mib": 142.39,
+    "is_truncated_jpeg_after_1mib": 1.273,
+    "opencv_decode": [
+      289,
+      305
+    ],
+    "pillow_decode": 314.7,
+    "pillow_lanczos_to_1600": 599,
+    "numpy_reference_to_1600": [
+      5233,
+      6192
+    ],
+    "opencv_resize": [
+      16,
+      20
+    ],
+    "opencv_encode": 7.0,
+    "pillow_encode": 22.6,
+    "exif_orientation": [
+      79,
+      126
+    ],
+    "bgr_to_rgb_float": 163.5,
+    "cvtcolor_bgr_to_rgb": 20.7,
+    "srgb_to_linear_lut_numpy": 318,
+    "srgb_to_linear_lut_cv2": 64,
+    "linear_light_resize_before": 13224,
+    "linear_light_resize_after": [
+      617,
+      736
+    ]
+  },
+  "quality_psnr_db": {
+    "contain_1024": 39.02,
+    "contain_1600": 42.53,
+    "cover_1000": 42.03,
+    "cover_1234": 44.24,
+    "cover_1600": 47.49,
+    "area_6mp": 87.8,
+    "mitchell_via_cubic": 48.4,
+    "nearest": 38.8,
+    "fast_jpeg_decode": [
+      38.0,
+      42.4
+    ],
+    "cmyk_cms_shortcut": [
+      46.8,
+      46.9
+    ],
+    "gray_alpha": "pixel-identical"
+  },
+  "tests": {
+    "passed": 389,
+    "skipped": 5,
+    "seconds": 58.04
+  },
+  "limitations": [
+    "warm cache only",
+    "no sampling profiler",
+    "GTX 1060 has no hardware JPEG decoder",
+    "48/96 subsets include five smaller images",
+    "GUI could not be measured because Tkinter is absent from .venv",
+    "parent-process RSS sampling was unreliable; memory uses in-child PeakWorkingSetSize"
+  ],
+  "followup": {
+    "linear_light_6_files": {
+      "files_per_s": 3.28,
+      "elapsed_s": 1.832,
+      "resize_ms": [
+        617,
+        736
+      ],
+      "psnr_db": [
+        41.0,
+        45.7
+      ],
+      "alpha_psnr_db": 53.9
+    },
+    "web_srgb_48": {
+      "files_per_s": 10.16,
+      "decode_ms": [
+        563,
+        582
+      ],
+      "output": "bit-identical to previous untagged path",
+      "icc_outputs": 48
+    },
+    "sharpen_48": {
+      "files_per_s": 8.82,
+      "resize_ms": [
+        137,
+        147
+      ],
+      "first_file_resize_before_ms": 1075.8,
+      "first_file_resize_after_ms": 47.3
+    },
+    "working_mb_cli": {
+      "test": "--working-mb 512 -> 536870912 bytes",
+      "status": "pass"
+    },
+    "gui_raw_bug": "fixed in gui.py; GUI not runnable without Tkinter"
+  }
+}

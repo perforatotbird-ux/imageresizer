@@ -75,6 +75,13 @@ class OutputVariant:
         return (f"{self.id}: {size} {self.mode}, q={self.quality}, "
                 f"chroma={self.subsampling}")
 
+    def to_spec(self) -> str:
+        if self.sizing == "resolution":
+            size = f"{self.max_w}x{self.max_h}"
+        else:
+            size = f"{self.sizing}:{self.sizing_value:g}"
+        return f"{self.id}:{size}:{self.mode}:{self.quality}:{self.subsampling}"
+
     def to_profile_dict(self) -> dict:
         if self.sizing == "resolution":
             size = {"mode": "resolution", "width": self.max_w,

@@ -28,6 +28,12 @@ PACKAGES = [
 
 def _pkg_version(mod: str) -> str:
     try:
+        from importlib.metadata import version
+        pkg_name = mod.split(".")[0].replace("_", "-")
+        return version(pkg_name)
+    except Exception:
+        pass
+    try:
         m = importlib.import_module(mod)
     except Exception:
         return "missing"
@@ -82,7 +88,7 @@ def _cpu_engine_check() -> tuple[bool, str]:
 
         img = np.zeros((64, 64, 3), dtype=np.uint8)
         img[:, :, 2] = 200
-        buf = CpuEngine.encode(img, 90, 2)
+        buf = CpuEngine().encode(img, 90, 2)
         eng = CpuEngine()
         out = eng.process(buf, Plan(64, 64, 32, 32, 0.0, 0.0, 64.0, 64.0), 90, 2)
         if not out.startswith(b"\xff\xd8"):

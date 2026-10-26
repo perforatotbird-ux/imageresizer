@@ -6,6 +6,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 from .ui_generated import DesignerBrand
+from .source_quality import QUALITY_SOURCE
 
 BG = '#F4F6FA'
 INK = '#17243B'
@@ -178,7 +179,8 @@ class ModernView:
         self.show_page(0)
         for var in [app.width_var,app.height_var,app.sizing_var,app.sizing_value_var,
                     app.mode_var,app.allow_upscale_var,app.jpeg_quality_var,app.backend_var,
-                    app.filter_var,app.bg_color_var,app.overwrite_var,app.skip_existing_var]:
+                    app.filter_var,app.bg_color_var,app.overwrite_var,app.skip_existing_var,
+                    app.max_file_size_var,app.min_quality_var,app.quality_var]:
             var.trace_add('write',self._schedule_summary)
         app.bind('<MouseWheel>',self._wheel,add='+')
         app.bind('<Button-4>',lambda e:self._wheel(e,-3),add='+')
@@ -267,72 +269,147 @@ class ModernView:
         ttk.Label(line,text='Пусто — обработать все',style='Muted.TLabel').pack(side='left',padx=12)
         self.control(ttk.Button(p,text='Посчитать изображения',command=a._count_files)).grid(row=14,column=0,sticky='w',pady=(12,8))
         ttk.Label(p,textvariable=a.recursive_note,style='Muted.TLabel',wraplength=380).grid(row=15,column=0,sticky='w')
+        nav_box = ttk.Frame(p); nav_box.grid(row=16, column=0, sticky='ew', pady=(18,4))
+        ttk.Button(nav_box, text='Далее: Размер и геометрия  →', style='Primary.TButton', command=lambda: self.show_page(1)).pack(side='right')
 
     def _resize_page(self,p):
         a=self.app
-        self.heading(p,'02','Размер и геометрия','Настройте границы, масштаб и способ вписывания.')
+        self.heading(p,'02','Размер и геометрия','Настройте способ масштабирования, границы и способ вписывания.')
         self.label(p,3,'Способ изменения размера')
         a.sizing_combo=self.combo(p,4,[x[1] for x in self.sizing_modes]);a.sizing_combo.current(0)
         a.sizing_combo.bind('<<ComboboxSelected>>',a._on_sizing_change)
-        self.label(p,5,'Пресет размера')
-        a.preset_combo=self.combo(p,6,[*self.size_presets,'custom']);a.preset_combo.set('web_1024')
+        self.sizing_mode_hint=ttk.Label(p,text='',style='Muted.TLabel',wraplength=380,font=('Segoe UI',9,'bold'))
+        self.sizing_mode_hint.grid(row=5,column=0,sticky='w',pady=(2,6))
+        self.preset_label=ttk.Label(p,text='Пресет размера (для режима по границам)',font=('Segoe UI',10,'bold'))
+        self.preset_label.grid(row=6,column=0,sticky='w',pady=(4,2))
+        a.preset_combo=self.combo(p,7,[*self.size_presets,'custom']);a.preset_combo.set('web_1024')
         a.preset_combo.bind('<<ComboboxSelected>>',a._on_preset_change)
-        dims=ttk.Frame(p);dims.grid(row=7,column=0,sticky='ew',pady=(14,0));dims.columnconfigure((0,2),weight=1)
-        for col,label,var in [(0,'Ширина, px',a.width_var),(2,'Высота, px',a.height_var)]:
-            ttk.Label(dims,text=label,style='Muted.TLabel').grid(row=0,column=col,sticky='w',pady=(0,6))
-            self.control(ttk.Entry(dims,textvariable=var,width=10)).grid(row=1,column=col,sticky='ew')
+        dims=ttk.Frame(p);dims.grid(row=8,column=0,sticky='ew',pady=(8,0));dims.columnconfigure((0,2),weight=1)
+        ttk.Label(dims,text='Ширина, px',style='Muted.TLabel').grid(row=0,column=0,sticky='w',pady=(0,4))
+        self.width_entry=self.control(ttk.Entry(dims,textvariable=a.width_var,width=10))
+        self.width_entry.grid(row=1,column=0,sticky='ew')
         ttk.Label(dims,text='×').grid(row=1,column=1,padx=10)
-        self.label(p,8,'Значение: % / мегапиксели / пиксели')
-        self.entry(p,9,a.sizing_value_var)
-        self.label(p,10,'Вписывание')
-        for row,text,val in [(11,'Contain — целиком, без обрезки','contain'),(12,'Cover — заполнить и обрезать по центру','cover')]:
-            self.control(ttk.Radiobutton(p,text=text,variable=a.mode_var,value=val)).grid(row=row,column=0,sticky='w')
-        self.check(p,13,'Разрешить увеличение маленьких фото',a.allow_upscale_var)
-        self.label(p,14,'Фильтр ресайза')
-        self.combo(p,15,['lanczos3','mitchell','area','bilinear','nearest','box'],a.filter_var)
-        ttk.Label(p,text='Без увеличения cover может дать результат меньше заданных границ.',style='Muted.TLabel',wraplength=380).grid(row=16,column=0,sticky='w',pady=(12,0))
+        ttk.Label(dims,text='Высота, px',style='Muted.TLabel').grid(row=0,column=2,sticky='w',pady=(0,4))
+        self.height_entry=self.control(ttk.Entry(dims,textvariable=a.height_var,width=10))
+        self.height_entry.grid(row=1,column=2,sticky='ew')
+        self.sizing_value_label=ttk.Label(p,text='Значение масштаба',font=('Segoe UI',10,'bold'))
+        self.sizing_value_label.grid(row=9,column=0,sticky='w',pady=(10,2))
+        self.sizing_value_entry=self.entry(p,10,a.sizing_value_var)
+        self.label(p,11,'Способ вписывания в рамку')
+        fit_modes=[
+            (12,'Contain — вписать целиком без обрезки (пропорции сохраняются)','contain'),
+            (13,'Cover — заполнить рамку и обрезать излишки (под точный размер)','cover'),
+            (14,'Pad — вписать целиком и дополнить канву полями до размера','pad')
+        ]
+        for row,text,val in fit_modes:
+            self.control(ttk.Radiobutton(p,text=text,variable=a.mode_var,value=val,command=a._sync_fit_mode)).grid(row=row,column=0,sticky='w')
+        anchor_frame=ttk.Frame(p);anchor_frame.grid(row=15,column=0,sticky='ew',pady=(6,2))
+        ttk.Label(anchor_frame,text='Точка привязки кадрирования / полей:',style='Muted.TLabel').pack(side='left',padx=(0,8))
+        a.crop_anchor_combo=self.control(ttk.Combobox(
+            anchor_frame,state='readonly',width=14,textvariable=a.crop_anchor_var,
+            values=['center','top','bottom','left','right','top-left','top-right','bottom-left','bottom-right']))
+        a.crop_anchor_combo.pack(side='left')
+        self.crop_anchor_hint=ttk.Label(p,text='',style='Muted.TLabel',wraplength=380)
+        self.crop_anchor_hint.grid(row=16,column=0,sticky='w')
+        self.check(p,17,'Разрешить увеличение маленьких фото (upscale)',a.allow_upscale_var)
+        sharpen_frame=ttk.Frame(p);sharpen_frame.grid(row=18,column=0,sticky='ew',pady=(8,2))
+        ttk.Label(sharpen_frame,text='Резкость контуров (Unsharp Mask):',style='Muted.TLabel').pack(side='left',padx=(0,8))
+        a.sharpen_combo=self.control(ttk.Combobox(
+            sharpen_frame,state='readonly',width=12,textvariable=a.sharpen_preset_var,
+            values=['off','weak','standard']))
+        a.sharpen_combo.pack(side='left')
+        self.label(p,19,'Фильтр ресайза (алгоритм интерполяции)')
+        self.combo(p,20,['lanczos3','mitchell','area','bilinear','nearest','box'],a.filter_var)
+        ttk.Label(p,text='lanczos3 — наивысшая резкость фото; mitchell — мягкий без ореолов; area — чистое уменьшение.',style='Muted.TLabel',wraplength=380).grid(row=21,column=0,sticky='w',pady=(4,8))
+        nav_box=ttk.Frame(p);nav_box.grid(row=22,column=0,sticky='ew',pady=(14,4))
+        ttk.Button(nav_box,text='← Назад: Папки',command=lambda:self.show_page(0)).pack(side='left')
+        ttk.Button(nav_box,text='Далее: Качество JPEG  →',style='Primary.TButton',command=lambda:self.show_page(2)).pack(side='right')
 
     def _jpeg(self,p):
         a=self.app
-        self.heading(p,'03','Хороший баланс качества','Выходной формат — JPEG. Даже q=100 остаётся lossy.')
+        self.heading(p,'03','Качество и сохранение','Выходной формат — JPEG. Баланс качества, размера и метаданных.')
         self.label(p,3,'Пресет качества')
-        a.quality_combo=self.combo(p,4,[x[1] for x in self.quality_choices]);a.quality_combo.current(2)
+        a.quality_combo=self.combo(p,4,[x[1] for x in self.quality_choices])
+        default_index=next((i for i,(key,_) in enumerate(self.quality_choices)
+                            if key=='balanced'),2)
+        a.quality_combo.current(default_index)
         a.quality_combo.bind('<<ComboboxSelected>>',a._on_quality_change)
-        self.label(p,5,'Качество JPEG')
+        self.label(p,5,'Шкала качества JPEG (1–100)')
         row=ttk.Frame(p);row.grid(row=6,column=0,sticky='ew');row.columnconfigure(0,weight=1)
         a.quality_scale=self.control(ttk.Scale(row,from_=1,to=100,orient='horizontal',command=a._on_quality_scale))
         a.quality_scale.grid(row=0,column=0,sticky='ew',padx=(0,16));a.quality_scale.set(80)
-        ttk.Label(row,textvariable=a.jpeg_quality_var,style='Metric.TLabel',width=3).grid(row=0,column=1)
-        self.label(p,7,'Цветовая субдискретизация')
+        self.quality_metric_label=ttk.Label(row,textvariable=a.jpeg_quality_var,style='Metric.TLabel',width=5)
+        self.quality_metric_label.grid(row=0,column=1)
+        self.label(p,7,'Цветовая субдискретизация (Chroma Subsampling)')
         a.subsampling_combo=self.combo(p,8,[x[1] for x in self.subsampling_choices]);a.subsampling_combo.current(0)
         a.subsampling_combo.bind('<<ComboboxSelected>>',a._on_subsampling_change)
-        self.label(p,9,'Фон прозрачности · #RRGGBB')
-        self.entry(p,10,a.bg_color_var)
-        self.label(p,11,'Метаданные')
-        self.check(p,12,'Сохранять EXIF с нормализацией ориентации',a.exif_var)
-        self.check(p,13,'Сохранять корректный цветовой профиль ICC',a.icc_var)
-        self.label(p,14,'Существующие результаты')
-        self.check(p,15,'Пропускать только проверенные результаты',a.skip_existing_var)
-        self.check(p,16,'Перезаписывать результаты при повторном запуске',a.overwrite_var)
-        ttk.Label(p,text='При включённом пропуске непроверенный файл не перезаписывается. Оригиналы защищены отдельно.',style='Muted.TLabel',wraplength=390).grid(row=17,column=0,sticky='w',pady=(10,0))
+        self.label(p,9,'Ограничение размера файла (Target Size Limit)')
+        limit_row=ttk.Frame(p);limit_row.grid(row=10,column=0,sticky='ew')
+        self.max_file_size_entry=self.control(ttk.Entry(limit_row,textvariable=a.max_file_size_var,width=12))
+        self.max_file_size_entry.pack(side='left')
+        ttk.Label(limit_row,text='Пусто — без ограничения (например, 500KB, 1.5MB)',style='Muted.TLabel').pack(side='left',padx=12)
+        minq_frame=ttk.Frame(p);minq_frame.grid(row=11,column=0,sticky='ew',pady=(6,2))
+        self.min_quality_label=ttk.Label(minq_frame,text='Минимальное качество для подбора:')
+        self.min_quality_label.pack(side='left',padx=(0,8))
+        self.min_quality_entry=self.control(ttk.Entry(minq_frame,textvariable=a.min_quality_var,width=6))
+        self.min_quality_entry.pack(side='left')
+        self.min_quality_hint=ttk.Label(p,text='',style='Muted.TLabel',wraplength=380)
+        self.min_quality_hint.grid(row=12,column=0,sticky='w')
+        self.allow_downscale_check=self.check(p,13,'Разрешить уменьшение разрешения при недостижимости лимита',a.allow_downscale_var)
+        self.label(p,14,'Цвет канвы и фона (#RRGGBB)')
+        self.entry(p,15,a.bg_color_var)
+        ttk.Label(p,text='Используется для прозрачных PNG/WebP и для полей канвы в режиме Pad.',style='Muted.TLabel',wraplength=380).grid(row=16,column=0,sticky='w')
+        self.label(p,17,'Метаданные и цветовой профиль')
+        self.check(p,18,'Сохранять EXIF с нормализацией ориентации',a.exif_var)
+        self.check(p,19,'Сохранять цветовой профиль ICC',a.icc_var)
+        self.check(p,20,'Очищать персональные данные (GPS, серийные номера, авторство)',a.strip_personal_var)
+        self.check(p,21,'Преобразовывать цвета в Web sRGB (для интернет-публикаций)',a.web_srgb_var)
+        self.check(p,22,'Линейный цвет (Linear-light resampling & blending)',a.linear_light_var)
+        self.label(p,23,'Существующие результаты в целевой папке')
+        for row,text,val in [
+            (24,'Перезаписывать существующие файлы при повторном запуске','overwrite'),
+            (25,'Пропускать уже готовые файлы (с проверкой хеша и структуры)','skip')]:
+            self.control(ttk.Radiobutton(p,text=text,variable=a.write_mode_var,value=val,command=a._sync_write_mode)).grid(row=row,column=0,sticky='w')
+        nav_box=ttk.Frame(p);nav_box.grid(row=26,column=0,sticky='ew',pady=(14,4))
+        ttk.Button(nav_box,text='← Назад: Размер',command=lambda:self.show_page(1)).pack(side='left')
+        ttk.Button(nav_box,text='Далее: Движок и ресурсы  →',style='Primary.TButton',command=lambda:self.show_page(3)).pack(side='right')
 
     def _engine(self,p):
+        import os
         a=self.app
-        self.heading(p,'04','Движок и ресурсы','Выбор маршрута обработки, памяти и восстановления.')
-        self.label(p,3,'Backend')
+        cpu_cores = os.cpu_count() or 8
+        self.heading(p,'04','Движок и ресурсы','Выбор маршрута обработки, потоков и аппаратных ресурсов.')
+        self.label(p,3,'Backend (движок выполнения)')
         self.combo(p,4,['auto','gpu','hybrid','cpu'],a.backend_var)
-        ttk.Label(p,text='auto — выбор доступного движка. GPU не означает GPU-only кодек.',style='Muted.TLabel',wraplength=380).grid(row=5,column=0,sticky='w',pady=(8,0))
-        rows=ttk.Frame(p);rows.grid(row=6,column=0,sticky='ew',pady=(16,0));rows.columnconfigure(1,weight=1)
-        for i,(label,var) in enumerate([('Потоки чтения',a.workers_var),('Размер GPU batch',a.batch_var),('Глубина очереди',a.queue_var),('Оценочный VRAM бюджет, GiB',a.vram_var)]):
-            ttk.Label(rows,text=label).grid(row=i,column=0,sticky='w',padx=(0,12),pady=6)
-            self.control(ttk.Entry(rows,textvariable=var,width=8)).grid(row=i,column=1,sticky='ew',pady=6)
-        ttk.Label(p,text='VRAM бюджет — мягкая оценка, не жёсткий лимит памяти драйвера.',style='Muted.TLabel',wraplength=390).grid(row=7,column=0,sticky='w',pady=(10,8))
-        self.label(p,8,'Надёжность')
-        self.check(p,9,'CPU fallback при отказе GPU',a.fallback_var)
-        self.check(p,10,'Пытаться читать усечённые JPEG',a.truncated_var)
-        self.check(p,11,'Оптимизировать таблицы Huffman на GPU',a.huffman_var)
-        self.check(p,12,'fsync перед публикацией результата',a.fsync_var)
-        ttk.Label(p,text=f'Python рабочего процесса:\n{a.worker}',style='Muted.TLabel',wraplength=390).grid(row=13,column=0,sticky='w',pady=(16,0))
+        ttk.Label(p,text='auto — автовыбор GPU при наличии (CUDA), иначе CPU. hybrid — декод CPU, ресайз GPU.',style='Muted.TLabel',wraplength=380).grid(row=5,column=0,sticky='w',pady=(4,0))
+        self.label(p,6,'Многопоточность и очереди конвейера')
+        rows=ttk.Frame(p);rows.grid(row=7,column=0,sticky='ew',pady=(8,0));rows.columnconfigure(1,weight=1)
+        grid_items = [
+            ('Потоки обработки (Processors / CPU ядра)', getattr(a, 'processors_var', a.workers_var), f'Пусто — Авто (CPU: {min(8, cpu_cores)} воркеров, GPU: 1 координатор). В системе: {cpu_cores} ядер'),
+            ('Потоки чтения с диска (Readers)', getattr(a, 'readers_var', a.workers_var), 'Чтение исходных файлов с накопителя в память'),
+            ('Потоки записи на диск (Writers)', getattr(a, 'writers_var', a.workers_var), 'Атомарная запись готовых результатов на диск'),
+            ('Размер GPU batch (параллелизм GPU)', a.batch_var, 'Сколько фото видеокарта обрабатывает одновременно на CUDA'),
+            ('Глубина очереди между стадиями', a.queue_var, 'Буфер задач между чтением, обработкой и записью'),
+            ('Оценочный VRAM бюджет, GiB', a.vram_var, 'Мягкий ориентир памяти GPU для формирования пачек'),
+        ]
+        for i,(label,var,hint) in enumerate(grid_items):
+            ttk.Label(rows,text=label).grid(row=i*2,column=0,sticky='w',padx=(0,12),pady=(4,1))
+            self.control(ttk.Entry(rows,textvariable=var,width=8)).grid(row=i*2,column=1,sticky='ew',pady=(4,1))
+            ttk.Label(rows,text=hint,style='Muted.TLabel',wraplength=380).grid(row=i*2+1,column=0,columnspan=2,sticky='w',pady=(0,5))
+        note_frame = ttk.Frame(p)
+        note_frame.grid(row=8, column=0, sticky='ew', pady=(8, 8))
+        ttk.Label(note_frame, text=f'ℹ Как работает многопоточность:\n'
+                                   f'• В режиме CPU обработка масштабируется по ядрам процессора (доступно ядер: {cpu_cores}).\n'
+                                   '• В режиме GPU 1 поток-координатор отправляет пачки в CUDA, где ядра видеокарты работают параллельно.',
+                  style='Muted.TLabel', wraplength=380).pack(anchor='w')
+        self.label(p,9,'Надёжность')
+        self.check(p,10,'CPU fallback при отказе GPU',a.fallback_var)
+        self.check(p,11,'Пытаться читать усечённые JPEG',a.truncated_var)
+        self.check(p,12,'Оптимизировать таблицы Huffman',a.huffman_var)
+        self.check(p,13,'fsync перед публикацией результата',a.fsync_var)
+        ttk.Label(p,text=f'Python рабочего процесса:\n{a.worker}',style='Muted.TLabel',wraplength=390).grid(row=14,column=0,sticky='w',pady=(8,0))
+        nav_box=ttk.Frame(p);nav_box.grid(row=15,column=0,sticky='ew',pady=(14,4))
+        ttk.Button(nav_box,text='← Назад: Качество JPEG',command=lambda:self.show_page(2)).pack(side='left')
 
     def _summary(self,parent):
         a=self.app
@@ -480,7 +557,18 @@ class ModernView:
         tools.bind('<Configure>',lambda e:self._reflow_tools(e),add='+')
         self.log_panel=tk.Frame(parent,bg='white',highlightbackground=BORDER,highlightthickness=1)
         self.log_panel.columnconfigure(0,weight=1);self.log_panel.rowconfigure(1,weight=1)
-        ttk.Label(self.log_panel,textvariable=a.threads_var,style='Muted.TLabel',padding=(12,6)).grid(row=0,column=0,sticky='w')
+        log_header = tk.Frame(self.log_panel, bg='white')
+        log_header.grid(row=0, column=0, columnspan=2, sticky='ew', padx=8, pady=(4, 4))
+        log_header.columnconfigure(0, weight=1)
+        ttk.Label(log_header, textvariable=a.threads_var, style='Muted.TLabel').grid(row=0, column=0, sticky='w')
+        log_btn_box = ttk.Frame(log_header)
+        log_btn_box.grid(row=0, column=1, sticky='e')
+        self.copy_log_button = ttk.Button(log_btn_box, text='Копировать лог', command=a._copy_log)
+        self.copy_log_button.pack(side='left', padx=(0, 4))
+        self.save_log_button = ttk.Button(log_btn_box, text='Сохранить в файл…', command=a._save_log)
+        self.save_log_button.pack(side='left', padx=(0, 4))
+        self.clear_log_button = ttk.Button(log_btn_box, text='Очистить', command=a._clear_log)
+        self.clear_log_button.pack(side='left')
         a.log=tk.Text(self.log_panel,height=7,wrap='word',state='disabled',bg='#17243B',fg='#E0E8F7',
                        insertbackground='white',selectbackground='#365889',bd=0,padx=12,pady=10,font=('Consolas',9))
         a.log.grid(row=1,column=0,sticky='nsew')
@@ -530,7 +618,6 @@ class ModernView:
 
     def update_summary(self):
         self._summary_pending=False;a=self.app
-        # Manual width/height edits must not keep a misleading named preset.
         name = a.preset_combo.get()
         if name in self.size_presets:
             try:
@@ -542,8 +629,35 @@ class ModernView:
         if mode=='resolution':text=f'{a.width_var.get() or "—"} × {a.height_var.get() or "—"} px'
         else:text=f'{a.sizing_value_var.get() or "—"} '+{'percent':'%','megapixels':'МП','longest':'px · длинная сторона','shortest':'px · короткая сторона'}.get(mode,'')
         self.summary_size.set(text)
-        self.summary_quality.set(f'{a.jpeg_quality_var.get()} / 100  ·  {a.filter_var.get()}')
-        self.summary_mode.set(('Целиком, без обрезки' if a.mode_var.get()=='contain' else 'Обрезка по центру')+
-                              ('\nУвеличение разрешено' if a.allow_upscale_var.get() else '\nБез увеличения'))
+        if a.quality_var.get() == QUALITY_SOURCE:
+            quality_text=f'Как у исходника  ·  {a.filter_var.get()}'
+        else:
+            quality_text=f'{a.jpeg_quality_var.get()} / 100  ·  {a.filter_var.get()}'
+        sharpen_val = getattr(a, 'sharpen_preset_var', None)
+        if sharpen_val and sharpen_val.get() in ('weak', 'standard'):
+            quality_text += f'  ·  резкость: {sharpen_val.get()}'
+        limit=a.max_file_size_var.get().strip()
+        if limit:
+            try:
+                min_quality=min(int(a.min_quality_var.get()),int(a.jpeg_quality_var.get()))
+            except ValueError:
+                min_quality=int(a.min_quality_var.get() or 30)
+            quality_text+=f'\nПредел {limit}  ·  мин. качество {min_quality}'
+        self.summary_quality.set(quality_text)
+        mode_val = a.mode_var.get()
+        anchor = getattr(a, 'crop_anchor_var', None)
+        anchor_text = f' ({anchor.get()})' if anchor and mode_val in ('cover', 'pad') else ''
+        fit_map = {'contain':'Целиком, без обрезки','cover':'Заполнение + обрезка','pad':'Вписывание + поля'}
+        fit_title = fit_map.get(mode_val, mode_val) + anchor_text
+        if a.allow_upscale_var.get():
+            fit_title += '\nУвеличение разрешено'
+        else:
+            fit_title += '\nБез увеличения'
+        self.summary_mode.set(fit_title)
         self.summary_backend.set({'auto':'Автовыбор','gpu':'CUDA + automatic codec','hybrid':'CPU decode + CUDA','cpu':'Только CPU'}.get(a.backend_var.get(),'—'))
-        self.summary_write.set('Пропуск: с проверкой manifest' if a.skip_existing_var.get() or not a.overwrite_var.get() else 'Перезапись результатов')
+        write_text = 'Пропуск: с проверкой manifest' if a.skip_existing_var.get() or not a.overwrite_var.get() else 'Перезапись результатов'
+        if getattr(a, 'strip_personal_var', None) and a.strip_personal_var.get():
+            write_text += '  ·  Очистка GPS'
+        if getattr(a, 'web_srgb_var', None) and a.web_srgb_var.get():
+            write_text += '  ·  Web sRGB'
+        self.summary_write.set(write_text)

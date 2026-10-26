@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BatchResize — отчёт о производительности</title>
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --paper: #ffffff;
+    --ink: #1f2933;
+    --muted: #5b6773;
+    --line: #d9dee3;
+    --accent: #245a7a;
+    --accent-soft: #e8f0f5;
+    --warn: #8a5a00;
+    --warn-soft: #fff4d6;
+    --bad: #8a2d2d;
+    --bad-soft: #fbe9e9;
+    --good: #1f6b45;
+    --good-soft: #e7f4ec;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 "Segoe UI", Tahoma, Arial, sans-serif;
+  }
+  main {
+    max-width: 1080px;
+    margin: 32px auto;
+    padding: 48px 56px;
+    background: var(--paper);
+    box-shadow: 0 8px 30px rgba(20, 35, 50, .08);
+  }
+  h1 { margin: 0 0 8px; font-size: 2.1rem; line-height: 1.15; color: var(--accent); }
+  h2 { margin: 42px 0 12px; font-size: 1.45rem; color: var(--accent); border-bottom: 2px solid var(--line); padding-bottom: 6px; }
+  h3 { margin: 26px 0 8px; font-size: 1.12rem; }
+  p { margin: 8px 0; }
+  .meta { color: var(--muted); margin-bottom: 24px; }
+  .meta span { display: inline-block; margin-right: 18px; }
+  .lead { font-size: 1.08rem; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0 8px; }
+  .card { border: 1px solid var(--line); background: var(--accent-soft); padding: 14px 16px; border-radius: 6px; }
+  .card b { display: block; font-size: 1.7rem; color: var(--accent); line-height: 1.1; }
+  .card small { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 18px; font-size: .94rem; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: #eef2f5; font-weight: 600; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  tbody tr:nth-child(even) { background: #fbfbfa; }
+  code { background: #eef1f3; padding: 1px 5px; border-radius: 3px; font: .9em Consolas, "Cascadia Mono", monospace; }
+  pre { background: #1f2933; color: #e8edf2; padding: 14px 16px; border-radius: 6px; overflow-x: auto; font-size: .88rem; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; margin: 14px 0; }
+  .warn { border-left: 4px solid var(--warn); background: var(--warn-soft); padding: 10px 14px; margin: 14px 0; }
+  .bad { border-left: 4px solid var(--bad); background: var(--bad-soft); padding: 10px 14px; margin: 14px 0; }
+  .good { border-left: 4px solid var(--good); background: var(--good-soft); padding: 10px 14px; margin: 14px 0; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
+  .p0 { background: var(--bad-soft); color: var(--bad); }
+  .p1 { background: var(--warn-soft); color: var(--warn); }
+  .p2 { background: var(--accent-soft); color: var(--accent); }
+  .p3 { background: #eceff1; color: var(--muted); }
+  .done { background: var(--good-soft); color: var(--good); }
+  ul, ol { margin: 8px 0 8px 24px; padding: 0; }
+  li { margin: 4px 0; }
+  .part { border: 1px solid var(--line); border-radius: 7px; padding: 16px 20px; margin: 18px 0; }
+  .part h3 { margin-top: 0; }
+  .accept { font-size: .92rem; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 10px; }
+  footer { margin-top: 48px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: .88rem; }
+  @media (max-width: 760px) {
+    main { margin: 0; padding: 24px 18px; }
+    .cards { grid-template-columns: 1fr 1fr; }
+    table { display: block; overflow-x: auto; }
+  }
+  @media print {
+    body { background: #fff; }
+    main { margin: 0; padding: 0; box-shadow: none; max-width: none; }
+    h2 { page-break-after: avoid; }
+    table, pre, .part { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>BatchResize — отчёт о производительности</h1>
+<p class="meta">
+  <span>Дата: 26 октября 2026</span>
+  <span>Ветка: <code>feature/mvp-0-3</code></span>
+  <span>База: <code>b4fc6b6</code></span>
+  <span>Платформа: Windows 10, Xeon E5-2670 v3, 15,8 ГиБ, GTX 1060 6 ГБ</span>
+</p>
+
+<p class="lead">
+  Сводный отчёт по замерам, оптимизациям и остающимся задачам. Подробные
+  англоязычные версии: <code>PERFORMANCE_AUDIT.md</code>,
+  <code>PERFORMANCE_BASELINE.md</code>,
+  <code>PERFORMANCE_OPTIMIZATION_REPORT.md</code>,
+  <code>PERFORMANCE_FINAL.md</code>. Машиночитаемые данные:
+  <code>benchmark/reference-results.json</code>.
+</p>
+
+<div class="good">
+  <b>Итог:</b> на реальном корпусе из 517 JPEG (в основном 22 Мп) конвейер
+  обрабатывает <b>10,72 файла/с на CPU</b> и <b>10,08 файла/с на GPU</b>
+  с нулём ошибок. На подвыборке из 48 файлов ускорение относительно старой
+  версии: <b>4,1× на CPU</b> и <b>2,8× на GPU</b>. Все 389 тестов проходят.
+</div>
+
+<div class="cards">
+  <div class="card"><b>4,1×</b><small>CPU, 48 файлов, web_1024</small></div>
+  <div class="card"><b>2,8×</b><small>GPU, 48 файлов, web_1024</small></div>
+  <div class="card"><b>10,72</b><small>файла/с, CPU, 517 файлов</small></div>
+  <div class="card"><b>389 / 5</b><small>тестов пройдено / пропущено</small></div>
+</div>
+
+<h2>1. Что и на чём измерялось</h2>
+
+<table>
+  <thead><tr><th>Параметр</th><th>Значение</th></tr></thead>
+  <tbody>
+    <tr><td>ОС</td><td>Windows 10 22H2, сборка 19045</td></tr>
+    <tr><td>CPU</td><td>Intel Xeon E5-2670 v3, 12 ядер / 24 логических потока</td></tr>
+    <tr><td>RAM</td><td>15,8 ГиБ</td></tr>
+    <tr><td>GPU</td><td>NVIDIA GeForce GTX 1060 6 ГБ, SM 6.1, драйвер 581.57, CUDA 12.9</td></tr>
+    <tr><td>Python</td><td>3.13.14 в <code>.venv</code></td></tr>
+    <tr><td>Библиотеки</td><td>numpy 2.5.4, OpenCV 5.0.0.93, Pillow 13.0.0, CuPy 14.2.0, nvImageCodec 0.9.0</td></tr>
+  </tbody>
+</table>
+
+<p><b>Корпус:</b> <code>input/</code> — 517 JPEG, 688 МиБ. Из них 303 портретных
+3840×5760, 209 альбомных 5760×3840 и 5 изображений от 6 до 13,5 Мп. Все RGB,
+без ICC и альфа-канала. Подвыборки 48 и 96 файлов включают пять меньших
+изображений, поэтому их абсолютная скорость чуть оптимистичнее полного прогона.</p>
+
+<p><b>Методика:</b> тёплый кэш, один прогревочный прогон, медиана нескольких
+повторов. <code>elapsed</code> — время самого конвейера, <code>wall</code> —
+включая запуск Python и CUDA. Время этапов — среднее на файл; этапы работают
+параллельно, поэтому их нельзя складывать. Качество — PSNR относительно
+прежнего вывода, а не относительно lossless-источника.</p>
+
+<div class="warn">
+  <b>Ограничения:</b> холодный кэш не измерялся; профилировщик (py-spy,
+  Scalene, Nsight) недоступен; GTX 1060 не имеет аппаратного JPEG-декодера;
+  GUI не запускался, потому что в <code>.venv</code> нет Tkinter. Пиковый RSS
+  измерялся внутри дочернего процесса, внешний сэмплер давал недостоверные
+  значения.
+</div>
+
+<h2>2. Было и стало</h2>
+
+<table>
+  <thead>
+    <tr><th>Режим</th><th class="num">Было, файлов/с</th><th class="num">Стало, файлов/с</th><th class="num">Ускорение</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>CPU, web_1024, 48 файлов</td><td class="num">2,45</td><td class="num">10,03</td><td class="num">4,1×</td></tr>
+    <tr><td>CPU, large_1600, 48 файлов</td><td class="num">2,59</td><td class="num">10,39</td><td class="num">4,0×</td></tr>
+    <tr><td>GPU, web_1024, 48 файлов</td><td class="num">3,64</td><td class="num">10,26</td><td class="num">2,8×</td></tr>
+    <tr><td>GPU, large_1600, 48 файлов</td><td class="num">3,51</td><td class="num">9,98</td><td class="num">2,8×</td></tr>
+  </tbody>
+</table>
+
+<p>«Было» — исходный код с бюджетом 1 ГиБ. «Стало» — новый адаптивный бюджет,
+который на этой машине равен 2 ГиБ. Если сравнивать при одинаковом бюджете
+1 ГиБ, только за счёт кода CPU ускоряется с 2,45 до 8,42 файла/с (3,4×),
+остальное даёт увеличение бюджета.</p>
+
+<h3>Полный корпус, 517 файлов, web_1024</h3>
+<table>
+  <thead>
+    <tr><th>Бэкенд</th><th class="num">elapsed, с</th><th class="num">wall, с</th><th class="num">файлов/с</th><th class="num">Ошибок</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>CPU</td><td class="num">48,2</td><td class="num">49,1</td><td class="num">10,72</td><td class="num">0</td></tr>
+    <tr><td>GPU</td><td class="num">51,3</td><td class="num">57,2</td><td class="num">10,08</td><td class="num">0</td></tr>
+  </tbody>
+</table>
+
+<p>На этой карте CPU и GPU практически сравнялись. GPU всё ещё заметно
+быстрее на сложных входах и снимает нагрузку с CPU, но на 517 файлах тратит
+около 5,9 с на запуск CUDA. Для небольших партий CPU обычно выгоднее.</p>
+
+<h2>3. Где было время</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Режим, 48 файлов</th>
+      <th class="num">Чтение, мс</th>
+      <th class="num">Декод, мс</th>
+      <th class="num">Ресайз, мс</th>
+      <th class="num">Код, мс</th>
+      <th class="num">Запись, мс</th>
+      <th class="num">elapsed, с</th>
+      <th class="num">файлов/с</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>CPU 1024, старый, 1 ГиБ</td><td class="num">575,8</td><td class="num">492,7</td><td class="num">811,6</td><td class="num">21,7</td><td class="num">536,3</td><td class="num">19,598</td><td class="num">2,45</td></tr>
+    <tr><td>CPU 1024, новый, 1 ГиБ</td><td class="num">16,4</td><td class="num">393,5</td><td class="num">20,9</td><td class="num">4,0</td><td class="num">9,8</td><td class="num">5,704</td><td class="num">8,42</td></tr>
+    <tr><td>CPU 1024, новый, 2 ГиБ</td><td class="num">23,1</td><td class="num">589,5</td><td class="num">42,7</td><td class="num">7,6</td><td class="num">20,2</td><td class="num">4,785</td><td class="num">10,03</td></tr>
+    <tr><td>CPU 1600, старый, 1 ГиБ</td><td class="num">642,0</td><td class="num">406,2</td><td class="num">828,9</td><td class="num">29,2</td><td class="num">503,4</td><td class="num">18,530</td><td class="num">2,59</td></tr>
+    <tr><td>CPU 1600, новый, 2 ГиБ</td><td class="num">18,9</td><td class="num">546,1</td><td class="num">57,2</td><td class="num">15,7</td><td class="num">22,6</td><td class="num">4,619</td><td class="num">10,39</td></tr>
+    <tr><td>GPU 1024, старый</td><td class="num">466,0</td><td class="num">110,1</td><td class="num">119,4</td><td class="num">3,4</td><td class="num">42,7</td><td class="num">13,188</td><td class="num">3,64</td></tr>
+    <tr><td>GPU 1024, новый</td><td class="num">13,8</td><td class="num">81,6</td><td class="num">1,03</td><td class="num">3,3</td><td class="num">19,2</td><td class="num">4,679</td><td class="num">10,26</td></tr>
+    <tr><td>GPU 1600, новый</td><td class="num">13,7</td><td class="num">79,1</td><td class="num">1,10</td><td class="num">8,8</td><td class="num">5,2</td><td class="num">4,808</td><td class="num">9,98</td></tr>
+  </tbody>
+</table>
+
+<p>Старые значения чтения и записи раздуты Python-сканом усечения, который
+удерживал GIL и сериализовал читающие потоки. Реальное улучшение ресайза:
+811,6 мс → 20,9–43,3 мс на файл. После оптимизаций главным остаётся
+JPEG-декод: 394–580 мс на 22 Мп при 1024 и 546 мс при 1600.</p>
+
+<h2>4. Что сделано</h2>
+
+<h3>4.1. Быстрая проверка усечения JPEG</h3>
+<p><code>batchresize/imageio_meta.py:58</code>. Вместо посимвольного обхода
+энтропийных данных используется <code>data.find(b"\xff", i + 1)</code> —
+переход к следующему маркеру силами C. Переменная длины сегмента переименована
+в <code>seg_len</code>, чтобы не затенять длину буфера.</p>
+<table>
+  <thead><tr><th>Случай</th><th class="num">Было</th><th class="num">Стало</th></tr></thead>
+  <tbody>
+    <tr><td>1 МиБ JPEG</td><td class="num">142,39 мс</td><td class="num">1,273 мс</td></tr>
+    <tr><td>517 файлов суммарно</td><td class="num">—</td><td class="num">1,297 с (2,5 мс/файл)</td></tr>
+    <tr><td>Расхождения со старым сканером</td><td class="num">—</td><td class="num">0 из 517</td></tr>
+  </tbody>
+</table>
+
+<h3>4.2. OpenCV-ресайз и округление субпиксельных кропов</h3>
+<p><code>batchresize/resampling.py:173, 203, 241</code>. Добавлены быстрые
+ядра OpenCV и отображение фильтров: <code>lanczos3 → INTER_LANCZOS4</code>,
+<code>mitchell → INTER_CUBIC</code>, <code>area → INTER_AREA</code>,
+<code>bilinear → INTER_LINEAR</code>, <code>box → INTER_AREA</code>.
+Субпиксельный кроп округляется до целых пикселей; допускается не более
+половины пикселя погрешности геометрии, всё, что действительно выходит за
+границы, уходит в эталонный движок. <code>area</code> и <code>box</code>
+при увеличении также используют эталонный движок, чтобы не менять семантику.</p>
+<table>
+  <thead><tr><th>Операция</th><th class="num">Было</th><th class="num">Стало</th></tr></thead>
+  <tbody>
+    <tr><td>22 Мп → 1600, один файл</td><td class="num">599 мс (Pillow)</td><td class="num">16–20 мс</td></tr>
+    <tr><td>Эталонный NumPy-ресайз</td><td class="num">5 233–6 192 мс</td><td class="num">оставлен как fallback</td></tr>
+    <tr><td>Пакетный ресайз, 1 ГиБ</td><td class="num">811,6 мс/файл</td><td class="num">20,9 мс/файл</td></tr>
+    <tr><td>Пакетный ресайз, 2 ГиБ</td><td class="num">811,6 мс/файл</td><td class="num">43,3 мс/файл</td></tr>
+    <tr><td>Субпиксельный cover-кроп</td><td class="num">599 мс (Pillow)</td><td class="num">11–29 мс</td></tr>
+  </tbody>
+</table>
+
+<h3>4.3. Адаптивный рабочий бюджет</h3>
+<p><code>batchresize/pipeline.py:38, 95</code>. Формула:
+<code>max(512 МиБ, min(2048 МиБ, physical_ram / 4))</code>. На машине
+15,8 ГиБ это 2 ГиБ. Один 22 Мп RGB-файл оценивается примерно в 238 МБ,
+поэтому 2 ГиБ позволяют держать восемь задач одновременно вместо четырёх.</p>
+<table>
+  <thead><tr><th>Бюджет</th><th class="num">Пиковый RSS</th><th class="num">файлов/с</th></tr></thead>
+  <tbody>
+    <tr><td>1 ГиБ</td><td class="num">816,1 МиБ</td><td class="num">7,5 (24 файла)</td></tr>
+    <tr><td>2 ГиБ</td><td class="num">1 521,6 МиБ</td><td class="num">8,9 (24 файла)</td></tr>
+  </tbody>
+</table>
+<p>На 48 файлах: 1 ГиБ — 8,42 файла/с, 2 ГиБ — 10,03; 2 ГиБ и 16
+процессоров — 10,76; 3 ГиБ и 16 процессоров — 10,51. Дальше упирается
+в пропускную способность памяти. По умолчанию оставлено восемь воркеров.</p>
+
+<h3>4.4. Быстрое альфа-композитирование</h3>
+<p><code>batchresize/cpu_backend.py:62</code>. Добавлен путь через
+<code>Image.alpha_composite</code>; NumPy-путь сохранён как fallback.
+На 3,2 Мп: 263–275 мс → 62–101 мс, MAE = 0.</p>
+
+<h3>4.5. Пропуск лишнего цветового преобразования</h3>
+<p><code>batchresize/pipeline.py:1057</code>. <code>needs_cms</code> теперь
+требует CMS только когда преобразование действительно нужно. Для L, CMYK и
+RGBA без ICC используется быстрый декод OpenCV. Условие
+<code>has_alpha and mode != "RGBA"</code> обязательно: без него L+tRNS
+давал чёрный вывод, и регрессионный тест это поймал.</p>
+<table>
+  <thead><tr><th>Вход</th><th class="num">Декод было</th><th class="num">Декод стало</th><th class="num">Было, файлов/с</th><th class="num">Стало, файлов/с</th></tr></thead>
+  <tbody>
+    <tr><td>Оттенки серого</td><td class="num">593 мс</td><td class="num">141 мс</td><td class="num">4,10</td><td class="num">5,88</td></tr>
+    <tr><td>CMYK</td><td class="num">886 мс</td><td class="num">338 мс</td><td class="num">2,65</td><td class="num">4,28</td></tr>
+    <tr><td>RGBA PNG</td><td class="num">251 мс</td><td class="num">91 мс</td><td class="num">3,86</td><td class="num">6,86</td></tr>
+    <tr><td>RGBA WebP</td><td class="num">309 мс</td><td class="num">79 мс</td><td class="num">3,83</td><td class="num">6,61</td></tr>
+  </tbody>
+</table>
+
+<h2>5. Масштабирование и дополнительные режимы</h2>
+
+<h3>96 файлов</h3>
+<table>
+  <thead><tr><th>Конфигурация</th><th class="num">файлов/с</th></tr></thead>
+  <tbody>
+    <tr><td>CPU, по умолчанию, 8 воркеров</td><td class="num">9,96</td></tr>
+    <tr><td>CPU, 16 процессоров, 4 чтения, 4 записи</td><td class="num">9,95</td></tr>
+    <tr><td>CPU, <code>--fast-jpeg-decode</code></td><td class="num">15,62</td></tr>
+    <tr><td>GPU, по умолчанию</td><td class="num">10,37</td></tr>
+  </tbody>
+</table>
+
+<h3>Дополнительные режимы, 48 файлов</h3>
+<table>
+  <thead><tr><th>Режим</th><th class="num">файлов/с</th><th>Главная стоимость</th></tr></thead>
+  <tbody>
+    <tr><td>По умолчанию</td><td class="num">10,03</td><td>декод</td></tr>
+    <tr><td><code>--mode cover</code></td><td class="num">10,23</td><td>декод</td></tr>
+    <tr><td><code>--strip-personal-data</code></td><td class="num">10,07</td><td>без заметных накладных расходов</td></tr>
+    <tr><td><code>--sharpen standard</code></td><td class="num">8,82</td><td>ресайз 137-147 мс/файл</td></tr>
+    <tr><td><code>--web-srgb</code></td><td class="num">10,16</td><td>декод 563-582 мс/файл</td></tr>
+    <tr><td><code>--linear-light</code> (6 файлов)</td><td class="num">3,28</td><td>ресайз 617-736 мс/файл</td></tr>
+    <tr><td><code>--fast-jpeg-decode</code> (96 файлов)</td><td class="num">15,62</td><td>качество 38,0–42,4 дБ</td></tr>
+    <tr><td>1024 + <code>thumb:512x512</code></td><td class="num">10,31 задач/с</td><td>20,6 выходов/с</td></tr>
+  </tbody>
+</table>
+
+<h2>6. Качество</h2>
+
+<p>PSNR относительно прежнего вывода, не относительно lossless-источника.</p>
+<table>
+  <thead><tr><th>Случай</th><th class="num">PSNR</th></tr></thead>
+  <tbody>
+    <tr><td>contain 1024</td><td class="num">39,02 дБ</td></tr>
+    <tr><td>contain 1600</td><td class="num">42,53 дБ</td></tr>
+    <tr><td>cover 1000</td><td class="num">42,03 дБ</td></tr>
+    <tr><td>cover 1234</td><td class="num">44,24 дБ</td></tr>
+    <tr><td>cover 1600</td><td class="num">47,49 дБ</td></tr>
+    <tr><td>area, кроп 6 Мп</td><td class="num">87,8 дБ</td></tr>
+    <tr><td>mitchell через cubic</td><td class="num">48,4 дБ</td></tr>
+    <tr><td>nearest</td><td class="num">38,8 дБ</td></tr>
+    <tr><td><code>--fast-jpeg-decode</code></td><td class="num">38,0–42,4 дБ</td></tr>
+    <tr><td>CMYK после пропуска CMS</td><td class="num">46,8–46,9 дБ</td></tr>
+    <tr><td>Серый / альфа</td><td class="num">пиксель в пиксель</td></tr>
+  </tbody>
+</table>
+
+<p>Все 517 выходов CPU и все 517 выходов GPU проходят <code>Image.verify()</code>
+и имеют ожидаемые размеры 683×1024 или 1024×683.</p>
+
+<h2>7. Что осталось и что с этим делать</h2>
+
+<p>Ниже — не общий список пожеланий, а разбитый на части план. Каждая часть
+заканчивается критерием готовности.</p>
+
+<div class="part">
+  <h3><span class="tag p0">Часть 1 — P0</span> Зафиксировать текущий результат и документацию</h3>
+  <ol>
+    <li>Оставить текущие умолчания: OpenCV-ресайз, адаптивный бюджет
+      2 ГиБ / 25 % RAM, 8 воркеров, Pillow-композитирование, суженный
+      <code>needs_cms</code>.</li>
+    <li>Обновить <code>README.md</code> и <code>REPORT.md</code>: убрать или
+      явно пометить как исторические цифры «46–62 файла/с» и «1,8–2,2×».
+      Для новых цифр указывать корпус, разрешение, бэкенд и тёплый кэш.</li>
+    <li>Добавить <code>benchmark/run_bench.py</code> в чек-лист релиза:
+      генерировать корпус, делать 3 повтора, сохранять JSON и медианы.</li>
+    <li>Проверить, что <code>benchmark/corpus/</code> и
+      <code>benchmark/results/</code> не попадают в git, а
+      <code>benchmark/reference-results.json</code> — попадает.</li>
+  </ol>
+  <p class="accept"><b>Готово, когда:</b> документация не обещает старые
+  цифры без оговорок; команда замера воспроизводится с нуля; полный набор
+  тестов снова даёт 389 passed / 5 skipped.</p>
+</div>
+
+<div class="part">
+  <h3><span class="tag done">Выполнено</span> Часть 2 — P1: цветовые режимы</h3>
+  <ol>
+    <li><b><code>--linear-light</code>.</b> Добавлен float-путь через OpenCV и
+      <code>cv2.LUT</code>; для больших уменьшений используется
+      <code>INTER_AREA</code>, чтобы убрать ringing Lanczos4 в линейном свете.
+      Результат: <b>3,28 файла/с вместо 0,22 (15×)</b>, ресайз
+      617-736 мс вместо 13 224 мс, PSNR 41,0-45,7 дБ относительно
+      эталонного движка.</li>
+    <li><b><code>--web-srgb</code>.</b> Для RGB/RGBA без ICC теперь используется
+      быстрый OpenCV-декод, а sRGB-профиль добавляется в <code>_finish</code>.
+      Результат: <b>10,16 вместо 4,83 файла/с</b>, декод 563-582 мс вместо
+      1 380 мс; на 48 файлах вывод бит-в-бит совпал со старым.</li>
+    <li>ICC-входы по-прежнему идут через Pillow/littleCMS. Пропуск CMS по
+      имени профиля запрещён: профиль может называться «sRGB» и иметь
+      гамму 1,0.</li>
+    <li><b><code>--fast-jpeg-decode</code></b> оставлен opt-in: 15,62 файла/с
+      на 96 файлах, но качество 38,0-42,4 дБ. Включение по умолчанию
+      отклонено.</li>
+  </ol>
+  <p class="accept"><b>Проверка:</b> 389 passed / 5 skipped; линейный свет
+  проверен на 6 файлах (41,0-45,7 дБ) и на альфа-входе (53,9 дБ);
+  web-srgb проверен на 48 файлах и сохраняет ICC во всех 48 выходах.</p>
+</div>
+
+<div class="part">
+  <h3><span class="tag p2">Часть 3 — P2</span> Основной путь: декод, ориентация, память</h3>
+  <ol>
+    <li><b>CPU-декод</b> — главное узкое место: 394–580 мс на 22 Мп при 1024
+      и 546 мс при 1600. Исследовать <code>IMREAD_REDUCED_*</code> только как
+      opt-in; проверить libjpeg-turbo/Pillow и сравнить PSNR. Цель — рост
+      пропускной способности без падения качества ниже согласованного порога.</li>
+    <li><b>EXIF-ориентация</b> — 77–126 мс/файл. Поворот после ресайза убрал
+      бы полный проход, но геометрия ориентаций 5–8 легко ломается; изменение
+      отложено до отдельного цикла с тестами на все 8 значений.</li>
+    <li><b><code>--sharpen standard</code></b> — исправлена случайная
+      инициализация CUDA при импорте CuPy на CPU: первый файл 1 076 мс → 47 мс,
+      поток 8,33 → 8,82 файла/с.</li>
+    <li><b>Бюджет памяти</b> — добавлен <code>--working-mb</code>; адаптивное
+      значение 2 ГиБ / 25 % RAM осталось по умолчанию. Добавлен тест
+      <code>--working-mb 512</code>.</li>
+    <li><b>GPU</b> — не тратить время на batch/worker-тюнинг для GTX 1060:
+      плато 10,2–10,4 файла/с доказано. Задокументировать, что для партий
+      меньше ~50 файлов CPU обычно выгоднее из-за 5,9 с запуска CUDA.</li>
+  </ol>
+  <p class="accept"><b>Готово, когда:</b> есть замеры до/после для каждого
+  изменения, ни один режим не ухудшил PSNR без явного решения, а бюджет
+  памяти проверен на машине с 8 ГиБ и на текущей.</p>
+</div>
+
+<div class="part">
+  <h3><span class="tag p3">Часть 4 — P3</span> GUI, наблюдаемость и старые аудиты</h3>
+  <ol>
+    <li>Собрать окружение с Tkinter и измерить запуск GUI, задержку превью и
+      обработку событий. Статический обзор не нашёл узкого места: события
+      разбираются каждые 100 мс, превью с задержкой, CLI — в подпроцессе,
+      <code>ui_view._schedule_summary</code> объединяется через
+      <code>after_idle</code>.</li>
+    <li>Исправлена отдельная ошибка корректности в <code>gui.py</code> около
+      строки 884: <code>_sync_size_limit_mode</code> теперь читает
+      <code>raw</code> до использования. GUI-замер по-прежнему невозможен
+      без Tkinter; это остаётся в плане.</li>
+    <li>Закрыть или явно вынести за рамки производительности старые находки:
+      AUD-001 (неверные метки пути в отчёте), AUD-002 (застарелый
+      <code>.batchresize.lock</code>), AUD-003 (константа Mitchell).</li>
+    <li>Добавить в отчёт поля, по которым видно, какой движок реально
+      работал, чтобы AUD-001 не повторялся.</li>
+  </ol>
+  <p class="accept"><b>Готово, когда:</b> GUI измерен на машине с Tkinter,
+  ошибка <code>raw</code> исправлена и покрыта GUI-тестом, а статус
+  AUD-001/002/003 явно указан в трекере.</p>
+</div>
+
+<div class="part">
+  <h3><span class="tag p2">Часть 5 — приёмка</span> Регрессия и критерии выпуска</h3>
+  <ol>
+    <li>Прогнать <code>pytest tests -q -ra</code>: ожидается 389 passed,
+      5 skipped (3 — нет Tkinter, 1 — привилегия symlink, 1 — нет CMYK ICC).</li>
+    <li>Прогнать полный корпус 517 файлов на CPU и GPU, проверить 0 ошибок
+      и <code>Image.verify()</code> для всех выходов.</li>
+    <li>Проверить качество на наборе contain/cover/area/mitchell, сером,
+      CMYK и альфа-входах; зафиксировать PSNR/ΔE.</li>
+    <li>Сохранить <code>benchmark/reference-results.json</code> и медианы
+      <code>run_bench.py</code> в артефактах релиза.</li>
+    <li>Отдельно указать, что холодный кэш не измерялся и что цифры
+      относятся к тёплому кэшу и данной конфигурации.</li>
+  </ol>
+  <p class="accept"><b>Готово, когда:</b> тесты зелёные, полный прогон без
+  ошибок,отчёт о качестве приложен, а в релизных заметках стоит оговорка о
+  методике замера.</p>
+</div>
+
+<h2>8. Быстрый запуск</h2>
+
+<pre><code># Генерация детерминированного синтетического корпуса (необязательно)
+.\.venv\Scripts\python.exe benchmark\make_corpus.py
+
+# Текущий код, реальный корпус, CPU
+.\.venv\Scripts\python.exe benchmark\run_bench.py --label final-cpu `
+  --input K:\Test\recoder\input --repeats 3 --warmup 1 `
+  -- --backend cpu --workers 8 --size web_1024
+
+# GPU
+.\.venv\Scripts\python.exe benchmark\run_bench.py --label final-gpu `
+  --input K:\Test\recoder\input --repeats 3 --warmup 1 `
+  -- --backend gpu --workers 8 --size web_1024
+
+# Полный набор тестов
+.\.venv\Scripts\python.exe -m pytest tests -q -ra</code></pre>
+
+<h2>9. Вывод</h2>
+
+<p>Основной путь теперь примерно в 4 раза быстрее на CPU и в 2,8 раза на
+GPU для 22 Мп файлов. Полный корпус из 517 файлов обрабатывается примерно
+за 49 с на CPU и 57 с на GPU (с учётом запуска), без ошибок. Остающиеся
+проблемы сосредоточены в необязательных цветовых режимах и в CPU-декоде,
+а не в ресайзе или вводе-выводе, которые доминировали раньше. Все изменения
+покрыты тестами; единственное заметное приближение — округление
+субпиксельного кропа максимум на половину исходного пикселя.</p>
+
+<footer>
+  Источники: <code>PERFORMANCE_AUDIT.md</code>,
+  <code>PERFORMANCE_BASELINE.md</code>,
+  <code>PERFORMANCE_OPTIMIZATION_REPORT.md</code>,
+  <code>PERFORMANCE_FINAL.md</code>,
+  <code>benchmark/reference-results.json</code>.
+  Отчёт сводный; английские документы содержат полные таблицы и оговорки.
+</footer>
+
+</main>
+</body>
+</html>
