@@ -79,6 +79,19 @@ def worker(tmp_path):
     instance.close()
 
 
+def test_preview_summary_reports_size_and_reduction():
+    from batchresize.preview import preview_summary
+    short, detail = preview_summary({
+        "source_w": 5760, "source_h": 3840, "source_bytes": 1_200_000,
+        "result_w": 1024, "result_h": 683, "jpeg_bytes": 95_000,
+    })
+    assert "5760 × 3840 px" in short
+    assert "1024 × 683 px" in short
+    assert "Уменьшение" in detail
+    assert "по площади" in detail
+    assert "файл −" in detail
+
+
 def test_preview_uses_the_real_pipeline(worker, tmp_path):
     from batchresize.cpu_backend import CpuEngine
     from batchresize.pipeline import Pipeline, RunOptions

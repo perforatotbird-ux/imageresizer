@@ -306,9 +306,9 @@
     "gray_alpha": "pixel-identical"
   },
   "tests": {
-    "passed": 391,
+    "passed": 392,
     "skipped": 5,
-    "seconds": 61.24
+    "seconds": 59.04
   },
   "limitations": [
     "warm cache only",

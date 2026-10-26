@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .presets import ALL_QUALITY_PRESETS, SIZE_PRESETS, auto_subsampling
 from .source_quality import QUALITY_SOURCE, SUBSAMPLING_SOURCE
-from .preview import PreviewClient
+from .preview import PreviewClient, preview_summary
 from .profiles import (Profile, ProfileError, build_profile, builtin_profiles,
                        default_profiles_path, export_profile, find_profile,
                        import_into, load_profiles, read_profile_file,
@@ -177,6 +177,7 @@ class BatchResizeUI(tk.Tk):
         self._preview_suspended = False
         self._preview_has_result = False
         self._large_preview = None
+        self._input_preview_after = None
 
         self._load_profile_store()
         self._build()
@@ -563,6 +564,7 @@ class BatchResizeUI(tk.Tk):
 
     # -- preview -------------------------------------------------------------
     def _install_preview_traces(self) -> None:
+        self.input_var.trace_add("write", self._on_input_path_change)
         self.preview_source_var.trace_add("write", self._schedule_preview)
         self.preview_mode_var.trace_add("write", self._on_preview_mode_change)
         self.preview_view_var.trace_add("write", self._schedule_preview)
@@ -576,6 +578,37 @@ class BatchResizeUI(tk.Tk):
                     self.max_file_size_var, self.min_quality_var,
                     self.allow_downscale_var):
             var.trace_add("write", self._schedule_preview)
+
+    def _on_input_path_change(self, *_args) -> None:
+        if self._input_preview_after is not None:
+            try:
+                self.after_cancel(self._input_preview_after)
+            except tk.TclError:
+                pass
+            self._input_preview_after = None
+        self._input_preview_after = self.after(350, self._auto_preview_first)
+
+    def _auto_preview_first(self) -> None:
+        """Pick the first sorted image from the selected input folder."""
+        self._input_preview_after = None
+        source = Path(self.input_var.get()).expanduser()
+        if not source.is_dir():
+            return
+        current = self.preview_source_var.get().strip()
+        if current:
+            try:
+                Path(current).expanduser().relative_to(source)
+                return
+            except (OSError, ValueError):
+                pass
+        try:
+            from .pipeline import discover
+            files = discover(source, exclude=Path(self.output_var.get()).resolve(),
+                             limit=1)
+        except (OSError, ValueError):
+            return
+        if files and self.preview_source_var.get().strip() != str(files[0]):
+            self.preview_source_var.set(str(files[0]))
 
     def _open_large_preview(self) -> None:
         window = self._large_preview
@@ -758,13 +791,8 @@ class BatchResizeUI(tk.Tk):
             self.preview_status_var.set("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u043f\u0440\u0435\u0432\u044c\u044e")
             return
         self._preview_has_result = True
-        source_w = int(payload.get("source_w", 0))
-        source_h = int(payload.get("source_h", 0))
-        result_w = int(payload.get("result_w", 0))
-        result_h = int(payload.get("result_h", 0))
-        kb = int(payload.get("jpeg_bytes", 0)) / 1024
-        self.preview_info_var.set(
-            f"{source_w} \xd7 {source_h} \u2192 {result_w} \xd7 {result_h} px  \xb7  {kb:.0f} \u041a\u0438\u0411")
+        short, detail = preview_summary(payload)
+        self.preview_info_var.set(short + (f"\n{detail}" if detail else ""))
         route = str(payload.get("route") or payload.get("backend") or "\u2014")
         requested = str(payload.get("requested_backend") or "\u2014")
         approximate = "  \xb7  \u043f\u0440\u0438\u0431\u043b\u0438\u0436\u0451\u043d\u043d\u043e\u0435" if payload.get("approximate") else ""
@@ -800,6 +828,12 @@ class BatchResizeUI(tk.Tk):
             self._schedule_preview()
 
     def _stop_preview(self) -> None:
+        if self._input_preview_after is not None:
+            try:
+                self.after_cancel(self._input_preview_after)
+            except tk.TclError:
+                pass
+            self._input_preview_after = None
         if self._preview_after is not None:
             try:
                 self.after_cancel(self._preview_after)

@@ -203,6 +203,7 @@ class PreviewService:
                 "route": ", ".join(sorted(report.get("backend_counts", {}))) or kind,
                 "codec_backend": report.get("codec_backend", ""),
                 "jpeg_bytes": size,
+                "source_bytes": source.stat().st_size,
                 "jpeg_sha256": digest,
                 "out_w": int(out_w),
                 "out_h": int(out_h),

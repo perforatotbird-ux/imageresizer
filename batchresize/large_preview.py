@@ -12,7 +12,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from .preview import PreviewClient
+from .preview import PreviewClient, preview_summary
 
 ZOOM_STEPS = (0.05, 0.1, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75,
               1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
@@ -45,6 +45,7 @@ class LargePreviewWindow:
         self._canvases: dict[str, tk.Canvas] = {}
         self.zoom_var = tk.StringVar(master=self.win, value="Вписать")
         self.status_var = tk.StringVar(master=self.win, value="Загрузка…")
+        self.info_var = tk.StringVar(master=self.win, value="")
 
         self._build()
         self.schedule(immediate=True)
@@ -67,6 +68,8 @@ class LargePreviewWindow:
                   style="Muted.TLabel").pack(side="left", padx=(18, 0))
         ttk.Label(toolbar, textvariable=self.status_var,
                   style="Muted.TLabel").pack(side="right")
+        ttk.Label(self.win, textvariable=self.info_var, style="Muted.TLabel",
+                  justify="left", padding=(12, 0, 12, 6)).pack(fill="x")
 
         body = ttk.Frame(self.win, padding=(8, 0, 8, 8))
         body.pack(fill="both", expand=True)
@@ -241,6 +244,8 @@ class LargePreviewWindow:
         if payload.get("view") == "fit":
             self._zoom = None
         self._zoom_label()
+        short, detail = preview_summary(payload)
+        self.info_var.set(short + (f"\n{detail}" if detail else ""))
         self.status_var.set("Готово" + (" · приближённо"
                                        if payload.get("approximate") else ""))
         self._draw_all()
@@ -249,6 +254,7 @@ class LargePreviewWindow:
     def _clear_images(self) -> None:
         self._images = {}
         self._data = None
+        self.info_var.set("")
         self._draw_all()
 
     def _draw_all(self) -> None:

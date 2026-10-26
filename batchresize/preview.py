@@ -16,6 +16,55 @@ import threading
 from pathlib import Path
 
 
+def format_bytes(value: int) -> str:
+    value = max(0, int(value))
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.1f} МБ".replace(".", ",")
+    if value >= 1024:
+        return f"{value / 1024:.0f} КБ"
+    return f"{value} Б"
+
+
+def format_percent(value: float) -> str:
+    return f"{value:.1f} %".replace(".", ",")
+
+
+def preview_summary(payload: dict) -> tuple[str, str]:
+    """Return a compact resolution/size line and a reduction line."""
+    source_w = int(payload.get("source_w") or 0)
+    source_h = int(payload.get("source_h") or 0)
+    result_w = int(payload.get("result_w") or 0)
+    result_h = int(payload.get("result_h") or 0)
+    source_bytes = int(payload.get("source_bytes") or 0)
+    result_bytes = int(payload.get("jpeg_bytes") or 0)
+    source_part = f"{source_w} × {source_h} px"
+    if source_bytes:
+        source_part += f" · {format_bytes(source_bytes)}"
+    short = f"{source_part}  →  {result_w} × {result_h} px"
+    if result_bytes:
+        short += f" · {format_bytes(result_bytes)}"
+
+    source_px = source_w * source_h
+    result_px = result_w * result_h
+    detail = ""
+    if source_px > 0 and result_px > 0:
+        ratio = result_px / float(source_px)
+        if ratio < 1.0:
+            detail = f"Уменьшение: {format_percent((1.0 - ratio) * 100)} по площади"
+        elif ratio > 1.0:
+            detail = f"Увеличение: {format_percent((ratio - 1.0) * 100)} по площади"
+        else:
+            detail = "Размер по площади не изменился"
+        detail += f" · масштаб {format_percent(ratio ** 0.5 * 100)}"
+        if source_bytes and result_bytes:
+            delta = (1.0 - result_bytes / float(source_bytes)) * 100.0
+            if delta >= 0:
+                detail += f" · файл −{format_percent(delta)}"
+            else:
+                detail += f" · файл +{format_percent(-delta)}"
+    return short, detail
+
+
 class PreviewClient:
     def __init__(self, python: Path, project_dir: Path, temp_root: Path,
                  events: queue.Queue, name: str = "preview") -> None:

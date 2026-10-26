@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -55,14 +56,15 @@ def test_preview_panel_shows_real_result(app, tmp_path):
     app.preview_source_var.set(str(source))
     wait_for_preview(app)
     assert "640 × 480" in app.preview_info_var.get()
-    assert "640 × 480 → 640 × 480" in app.preview_info_var.get()
+    assert "640 × 480 px" in app.preview_info_var.get()
+    assert "→  640 × 480 px" in app.preview_info_var.get()
     assert app.view._preview_images and app.view._preview_data
     assert app.view.preview_canvas.find_all()
 
     app.width_var.set("320")
     app.height_var.set("240")
     wait_for_preview(app)
-    assert "640 × 480 → 320 × 240" in app.preview_info_var.get()
+    assert "→  320 × 240 px" in app.preview_info_var.get()
 
 
 def test_preview_modes_and_view_buttons(app, tmp_path):
@@ -116,6 +118,41 @@ def wait_for_large(app, timeout=90):
             return window
         time.sleep(0.02)
     pytest.fail("large preview did not become ready")
+
+
+def wait_for_source(app, expected, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.update()
+        if Path(app.preview_source_var.get()).resolve() == Path(expected).resolve():
+            app.update()
+            return
+        time.sleep(0.02)
+    pytest.fail(f"preview source was not auto-selected: {app.preview_source_var.get()}")
+
+
+def test_input_folder_autoselects_first_image(app, tmp_path):
+    from PIL import Image
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    Image.new("RGB", (800, 600), (10, 80, 160)).save(folder / "b.jpg")
+    Image.new("RGB", (800, 600), (160, 80, 10)).save(folder / "a.jpg")
+    app.output_var.set(str(tmp_path / "out"))
+    app.width_var.set("400")
+    app.height_var.set("300")
+    app.input_var.set(str(folder))
+    wait_for_source(app, folder / "a.jpg")
+    wait_for_preview(app)
+    info = app.preview_info_var.get()
+    assert "Уменьшение" in info
+    assert "400 × 300" in info
+
+    app._open_large_preview()
+    window = wait_for_large(app)
+    assert "Уменьшение" in window.info_var.get()
+    assert "400 × 300" in window.info_var.get()
+    window.close()
 
 
 def test_large_preview_zooms_both_panes(app, tmp_path):
