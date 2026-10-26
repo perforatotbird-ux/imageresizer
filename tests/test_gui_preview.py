@@ -174,8 +174,9 @@ def test_large_preview_zooms_both_panes(app, tmp_path):
     window.actual()
     window = wait_for_large(app)
     assert window._zoom == 1.0
-    assert (window._images["original"].width(),
-            window._images["original"].height()) == (800, 600)
+    assert window._data["view"] == "viewport"
+    assert window._images["original"].height() == 600
+    assert window._images["original"].width() <= window._box()[0]
 
     window.zoom_by(-1)
     window = wait_for_large(app)

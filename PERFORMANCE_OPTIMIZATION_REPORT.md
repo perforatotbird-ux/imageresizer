@@ -289,7 +289,7 @@ for a single image or a small batch it is the dominant avoidable cost.
 Final full suite:
 
 ```
-392 passed, 5 skipped in 59.04s
+392 passed, 5 skipped in 70.46s
 ```
 
 Skips: three GUI modules because Tkinter is absent from `.venv`, one symlink

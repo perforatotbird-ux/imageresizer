@@ -16,7 +16,6 @@ from .preview import PreviewClient, preview_summary
 
 ZOOM_STEPS = (0.05, 0.1, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75,
               1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
-MAX_PREVIEW_PIXELS = 24_000_000
 
 
 class LargePreviewWindow:
@@ -40,6 +39,8 @@ class LargePreviewWindow:
         self._paused = False
         self._closed = False
         self._zoom = None
+        self._center = [0.5, 0.5]
+        self._pan_start = None
         self._images: dict[str, tk.PhotoImage] = {}
         self._data = None
         self._canvases: dict[str, tk.Canvas] = {}
@@ -100,9 +101,9 @@ class LargePreviewWindow:
             hbar.grid(row=2, column=0, sticky="ew")
             canvas.bind("<Configure>", self._on_configure)
             canvas.bind("<ButtonPress-1>",
-                        lambda event, c=canvas: c.scan_mark(event.x, event.y))
-            canvas.bind("<B1-Motion>",
-                        lambda event, c=canvas: c.scan_dragto(event.x, event.y, gain=1))
+                        lambda event, k=key: self._pan_start_event(k, event))
+            canvas.bind("<B1-Motion>", self._pan_move_event)
+            canvas.bind("<ButtonRelease-1>", self._pan_end_event)
             canvas.bind("<MouseWheel>", self._on_wheel)
             canvas.bind("<Button-4>", lambda _event: self.zoom_by(1))
             canvas.bind("<Button-5>", lambda _event: self.zoom_by(-1))
@@ -136,17 +137,21 @@ class LargePreviewWindow:
             return
         self._zoom = target
         self._zoom_label()
-        self._request()
+        self.status_var.set("Обновление…")
+        self._schedule_request(160)
 
     def fit(self) -> None:
         self._zoom = None
+        self._center = [0.5, 0.5]
         self._zoom_label()
-        self._request()
+        self.status_var.set("Обновление…")
+        self._schedule_request(10)
 
     def actual(self) -> None:
         self._zoom = 1.0
         self._zoom_label()
-        self._request()
+        self.status_var.set("Обновление…")
+        self._schedule_request(40)
 
     def _on_wheel(self, event) -> str:
         if getattr(event, "delta", 0):
@@ -163,7 +168,15 @@ class LargePreviewWindow:
             self.status_var.set("Файл превью не выбран")
             self._clear_images()
             return
+        self._request_id = -1
         self._after = self.win.after(10 if immediate else 420, self._request)
+
+    def _schedule_request(self, delay: int) -> None:
+        if self._closed or self._paused:
+            return
+        self._cancel_after()
+        self._request_id = -1
+        self._after = self.win.after(max(1, int(delay)), self._request)
 
     def _cancel_after(self) -> None:
         if self._after is not None:
@@ -200,14 +213,15 @@ class LargePreviewWindow:
         width, height = self._box()
         payload = {
             "source": str(source),
-            "view": "fit" if self._zoom is None else "zoom",
+            "view": "fit" if self._zoom is None else "viewport",
             "box_w": width,
             "box_h": height,
             "params": params,
         }
         if self._zoom is not None:
             payload["zoom"] = self._zoom
-            payload["max_pixels"] = MAX_PREVIEW_PIXELS
+            payload["center_x"] = self._center[0]
+            payload["center_y"] = self._center[1]
         self._request_id = self._client.request(payload)
         self.status_var.set("Обновление…")
 
@@ -287,10 +301,48 @@ class LargePreviewWindow:
         else:
             canvas.yview_moveto(0.0)
 
+    def _pan_start_event(self, _key: str, event) -> None:
+        if self._zoom is None or self._data is None:
+            return
+        self._pan_start = (_key, event.x, event.y, self._center[0], self._center[1])
+        try:
+            event.widget.configure(cursor="fleur")
+        except tk.TclError:
+            pass
+
+    def _pan_move_event(self, event) -> None:
+        if self._pan_start is None or self._zoom is None:
+            return
+        data = self._data or {}
+        pane, start_x, start_y, center_x, center_y = self._pan_start
+        if pane == "result":
+            source_w = max(1, int(data.get("result_w") or 1))
+            source_h = max(1, int(data.get("result_h") or 1))
+        else:
+            source_w = max(1, int(data.get("source_w") or 1))
+            source_h = max(1, int(data.get("source_h") or 1))
+        dx = event.x - start_x
+        dy = event.y - start_y
+        self._center[0] = min(1.0, max(0.0, center_x - dx / (self._zoom * source_w)))
+        self._center[1] = min(1.0, max(0.0, center_y - dy / (self._zoom * source_h)))
+        self.status_var.set("Перемещение…")
+        self._schedule_request(50)
+
+    def _pan_end_event(self, event) -> None:
+        if self._pan_start is None:
+            return
+        self._pan_start = None
+        try:
+            event.widget.configure(cursor="")
+        except tk.TclError:
+            pass
+        if self._zoom is not None:
+            self._schedule_request(1)
+
     def _on_configure(self, _event=None) -> None:
         if self._data is not None:
             self._draw_all()
-        if self._zoom is None and self._after is None:
+        if self._data is not None and self._after is None:
             self.schedule()
 
     # -- lifecycle ----------------------------------------------------------

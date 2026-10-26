@@ -308,7 +308,7 @@
   "tests": {
     "passed": 392,
     "skipped": 5,
-    "seconds": 59.04
+    "seconds": 70.46
   },
   "limitations": [
     "warm cache only",

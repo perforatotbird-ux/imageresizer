@@ -90,6 +90,10 @@ class PreviewService:
         self._last_meta = None
         self._last_displays: list[Path] = []
         self._retained_dir: Path | None = None
+        self._display_source: Image.Image | None = None
+        self._display_source_key = None
+        self._display_result: Image.Image | None = None
+        self._display_result_key = None
 
     # -- engine ------------------------------------------------------------
     def _engine_for(self, backend: str, filter_name: str, optimize: bool):
@@ -197,6 +201,8 @@ class PreviewService:
                 self._last_jpeg = target
                 self._retained_dir = run_dir
                 run_dir = None  # keep the oversized result for this response
+            self._display_result = None
+            self._display_result_key = None
             self._last_meta = {
                 "backend": report.get("backend", kind),
                 "requested_backend": backend,
@@ -215,6 +221,49 @@ class PreviewService:
                 shutil.rmtree(run_dir, ignore_errors=True)
 
     # -- display -----------------------------------------------------------
+    def _source_image(self, source: Path) -> Image.Image:
+        stat = source.stat()
+        key = (str(source.resolve()), stat.st_mtime_ns, stat.st_size)
+        if self._display_source is None or self._display_source_key != key:
+            with Image.open(source) as original_file:
+                self._display_source = ImageOps.exif_transpose(original_file).convert("RGB")
+            self._display_source_key = key
+        return self._display_source
+
+    def _result_image(self) -> Image.Image:
+        assert self._last_jpeg is not None
+        path = Path(self._last_jpeg)
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if self._display_result is None or self._display_result_key != key:
+            with Image.open(path) as result_file:
+                self._display_result = result_file.convert("RGB")
+            self._display_result_key = key
+        return self._display_result
+
+    @staticmethod
+    def _viewport_frame(image: Image.Image, box_w: int, box_h: int,
+                        zoom: float, center_x: float,
+                        center_y: float) -> Image.Image:
+        """Crop the visible viewport and scale it to at most box_w x box_h."""
+        iw, ih = image.size
+        scale = max(0.01, float(zoom))
+        disp_w = iw * scale
+        disp_h = ih * scale
+        if disp_w <= box_w and disp_h <= box_h:
+            return image.resize((max(1, round(disp_w)), max(1, round(disp_h))),
+                                Image.Resampling.LANCZOS)
+        crop_w = min(float(iw), box_w / scale)
+        crop_h = min(float(ih), box_h / scale)
+        cx = min(1.0, max(0.0, float(center_x))) * iw
+        cy = min(1.0, max(0.0, float(center_y))) * ih
+        left = min(max(0.0, cx - crop_w / 2.0), iw - crop_w)
+        top = min(max(0.0, cy - crop_h / 2.0), ih - crop_h)
+        out_w = max(1, round(crop_w * scale))
+        out_h = max(1, round(crop_h * scale))
+        return image.resize((out_w, out_h), Image.Resampling.LANCZOS,
+                            box=(left, top, left + crop_w, top + crop_h))
+
     def _clear_displays(self) -> None:
         for path in self._last_displays:
             try:
@@ -235,32 +284,47 @@ class PreviewService:
     def _displays(self, source: Path, req: dict, result_w: int,
                   result_h: int) -> dict:
         view = str(req.get("view", "fit"))
-        box_w = int(req.get("box_w", 300))
-        box_h = int(req.get("box_h", 200))
+        box_w = max(1, int(req.get("box_w", 300)))
+        box_h = max(1, int(req.get("box_h", 200)))
         approximate = False
-        with Image.open(source) as original_file:
-            original = ImageOps.exif_transpose(original_file).convert("RGB")
-            source_w, source_h = original.size
-            if view == "zoom":
-                zoom = float(req.get("zoom", 1.0))
-                max_pixels = int(req.get("max_pixels", MAX_ZOOM_PREVIEW_PIXELS))
-                max_pixels = max(1, min(max_pixels, 48_000_000))
-                ow, oh, oa = _zoom_size(source_w, source_h, zoom, max_pixels)
-                rw, rh, ra = _zoom_size(result_w, result_h, zoom, max_pixels)
-                approximate = oa or ra
-            elif view == "actual":
-                ow, oh, oa = _actual_size(source_w, source_h)
-                rw, rh, ra = _actual_size(result_w, result_h)
-                approximate = oa or ra
-            else:
-                ow, oh = _fit_size(source_w, source_h, box_w, box_h)
-                rw, rh = _fit_size(result_w, result_h, box_w, box_h)
-            original_path = self._write_display(original, "original.png", ow, oh)
+        original = self._source_image(source)
+        source_w, source_h = original.size
+        result = self._result_image()
 
-        assert self._last_jpeg is not None
-        with Image.open(self._last_jpeg) as result_file:
-            result = result_file.convert("RGB")
-            result_path = self._write_display(result, "result.png", rw, rh)
+        zoom = None
+        if view == "viewport":
+            zoom = float(req.get("zoom", 1.0))
+            center_x = float(req.get("center_x", 0.5))
+            center_y = float(req.get("center_y", 0.5))
+            original_frame = self._viewport_frame(
+                original, box_w, box_h, zoom, center_x, center_y)
+            result_frame = self._viewport_frame(
+                result, box_w, box_h, zoom, center_x, center_y)
+        elif view == "zoom":
+            zoom = float(req.get("zoom", 1.0))
+            max_pixels = int(req.get("max_pixels", MAX_ZOOM_PREVIEW_PIXELS))
+            max_pixels = max(1, min(max_pixels, 48_000_000))
+            ow, oh, oa = _zoom_size(source_w, source_h, zoom, max_pixels)
+            rw, rh, ra = _zoom_size(result_w, result_h, zoom, max_pixels)
+            approximate = oa or ra
+            original_frame = original.resize((ow, oh), Image.Resampling.LANCZOS)
+            result_frame = result.resize((rw, rh), Image.Resampling.LANCZOS)
+        elif view == "actual":
+            ow, oh, oa = _actual_size(source_w, source_h)
+            rw, rh, ra = _actual_size(result_w, result_h)
+            approximate = oa or ra
+            original_frame = original.resize((ow, oh), Image.Resampling.LANCZOS)
+            result_frame = result.resize((rw, rh), Image.Resampling.LANCZOS)
+        else:
+            ow, oh = _fit_size(source_w, source_h, box_w, box_h)
+            rw, rh = _fit_size(result_w, result_h, box_w, box_h)
+            original_frame = original.resize((ow, oh), Image.Resampling.LANCZOS)
+            result_frame = result.resize((rw, rh), Image.Resampling.LANCZOS)
+
+        ow, oh = original_frame.size
+        rw, rh = result_frame.size
+        original_path = self._write_display(original_frame, "original.png", ow, oh)
+        result_path = self._write_display(result_frame, "result.png", rw, rh)
 
         return {
             "original": {"path": str(original_path), "w": ow, "h": oh},
@@ -270,6 +334,7 @@ class PreviewService:
             "result_w": result_w,
             "result_h": result_h,
             "view": view,
+            "zoom": zoom,
             "approximate": approximate,
         }
 
